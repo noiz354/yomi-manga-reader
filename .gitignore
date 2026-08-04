@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+
+# builds
+.next/
+out/
+dist/
+drizzle/meta/_snapshot*
+
+# env & secrets — NEVER commit
+.env
+.env.*
+!.env.prod.example
+
+# logs & local state
+*.log
+coverage/
+test-results/
+playwright-report/
+
+# OS
+.DS_Store
+
+# transient boundary self-test fixtures (npm run lint:boundaries)
+**/boundary-selftest-*
+tests/.boundary-fixtures/
+
+# filesystem object storage (the default STORAGE_DIR root).
+# The seed writes real page objects here now, so without this a run without
+# STORAGE_DIR leaves ~18 MB of generated media untracked in the repo.
+# Anchored to the project root on purpose: an unanchored `storage/` also matches
+# src/server/storage/, which is product source.
+/storage/
+
+# tsc build info (local only)
+tsconfig.tsbuildinfo
