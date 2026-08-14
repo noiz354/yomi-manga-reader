@@ -1,0 +1,237 @@
+/*
+ * Yomi — theme tokens.
+ *
+ * The only file in `src/` where a colour value is written; every other
+ * stylesheet and component references these custom properties, and a colour
+ * literal elsewhere is a defect. Contrast is enforced by
+ * `scripts/check-token-contrast.mjs`, which parses the `@contrast` lines below
+ * and fails CI when a required pair drops below its minimum, so a new token
+ * cannot ship unchecked. Colours are oklch() light-dark() pairs throughout, so
+ * dark mode is a re-authoring rather than an inversion.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Ground */
+  --bg-canvas: light-dark(oklch(0.968 0.006 70), oklch(0.172 0.008 70));
+  --bg-surface: light-dark(oklch(0.995 0.003 80), oklch(0.218 0.009 70));
+  --bg-sunken: light-dark(oklch(0.945 0.008 70), oklch(0.142 0.008 70));
+
+  /* The skip link and the admin nav sit on the one dark surface in the
+     product, in BOTH themes: they are chrome, not content, so they read as
+     an instrument rather than as another page surface. */
+  --bg-chrome: oklch(0.178 0.01 60);
+
+  /* Ink — four levels. ink-muted is the meta/caption tier and still clears
+     4.5:1 on every ground; there is deliberately no fifth "faint" tier,
+     because nothing this phase renders is decorative enough to justify a
+     text colour that fails the floor. */
+  --ink-primary: light-dark(oklch(0.235 0.014 55), oklch(0.948 0.006 80));
+  --ink-secondary: light-dark(oklch(0.432 0.014 55), oklch(0.802 0.008 80));
+  --ink-muted: light-dark(oklch(0.505 0.012 55), oklch(0.702 0.01 80));
+  --ink-on-accent: light-dark(oklch(0.992 0.004 80), oklch(0.168 0.02 42));
+  --ink-chrome: oklch(0.952 0.005 80);
+
+  /* Body links. A deeper step of the same ramp than --accent-base, because
+     a link is TEXT at body size while the accent fill is a UI boundary. */
+  --link-ink: light-dark(oklch(0.462 0.17 32), oklch(0.79 0.13 46));
+
+  /* Accent — vermilion, stepped rather than hand-picked per state. */
+  --accent-base: light-dark(oklch(0.512 0.185 30), oklch(0.655 0.17 34));
+  --accent-hover: light-dark(oklch(0.452 0.18 30), oklch(0.718 0.162 36));
+  --accent-press: light-dark(oklch(0.408 0.172 30), oklch(0.775 0.152 38));
+
+  /* Lines */
+  /* Identifies a control — inputs, buttons, panels. Carries 3:1. */
+  --line-control: light-dark(oklch(0.598 0.014 70), oklch(0.605 0.014 70));
+  /* Separates regions that are already identified by their text. Decoration
+     only, so it is exempt below rather than silently unchecked. */
+  --line-hairline: light-dark(oklch(0.918 0.008 70), oklch(0.282 0.01 70));
+
+  /* The quiet accent: a pressed filter chip and anything else that needs the
+     accent's identity without its weight. A wash of the same hue, not a second
+     hue — the product has one accent, and "selected" must not invent a colour.
+     Stepped the same way as the base ramp: the wash is the -quiet pair's ground
+     and the ink is the step that reads 4.5:1 on that wash, in both themes. */
+  --accent-quiet-bg: light-dark(oklch(0.941 0.036 32), oklch(0.302 0.055 32));
+  --accent-quiet-ink: light-dark(oklch(0.436 0.15 30), oklch(0.862 0.086 42));
+  /* The pressed chip's boundary. SC 1.4.11 is satisfied by the edge against the
+     surround (the page surface), not by the edge against the chip's own fill —
+     a fill and its own border are decoration pretending to be an indicator.
+     The pressed state is additionally carried by font-weight and aria-pressed,
+     so it is never colour-alone. */
+  --accent-quiet-edge: light-dark(oklch(0.63 0.145 32), oklch(0.612 0.13 36));
+
+  /* Focus — a two-band indicator (WCAG 2.1 SC 1.4.11).
+   *
+   * No single ring colour can clear 3:1 against both a near-white surface
+   * and the vermilion fill: the arithmetic is unforgiving (a band light
+   * enough for the fill is invisible on paper; one dark enough for paper is
+   * invisible on the fill). So the indicator is painted in two bands, and
+   * each band is declared against the surface it is actually next to:
+   *
+   *   --focus-outer           2px outside the control, on the surround
+   *   --focus-inner           on a control fill that contrasts with its
+   *                           surround (the filled accent button)
+   *   --focus-inner-on-dark   on the always-dark chrome (the skip link)
+   *
+   * A control whose fill is its own surround colour (an input on a surface)
+   * gets the outer band only: an inner band there would be 1.03:1 against
+   * its own fill, i.e. decoration pretending to be an indicator. The pairs
+   * below are the real adjacencies, which is why the ring holds on a
+   * surface, on a filled button, and on the dark chrome bar in both themes.
+   */
+  --focus-outer: light-dark(oklch(0.222 0.02 55), oklch(0.93 0.02 80));
+  --focus-inner: light-dark(oklch(0.985 0.004 80), oklch(0.148 0.01 60));
+  --focus-inner-on-dark: oklch(0.968 0.01 80);
+
+  /* Danger — the one status tone the form field needs. Inline error text
+     never ships alone: the field also gets aria-invalid and the message is
+     linked with aria-describedby. */
+  --danger-ink: light-dark(oklch(0.428 0.15 27), oklch(0.872 0.098 30));
+  --danger-bg: light-dark(oklch(0.95 0.038 26), oklch(0.312 0.082 26));
+}
+
+/* Required contrast pairs — the CI contract.
+ *
+ * Format: @contrast <foreground> <background> <minimum> <why>
+ * Rule:   text pairs 4.5:1 (SC 1.4.3), non-text pairs 3:1 (SC 1.4.11).
+ */
+
+/* body and meta text on every ground the shell paints */
+/* @contrast --ink-primary --bg-canvas 4.5 body copy, the app ground */
+/* @contrast --ink-primary --bg-surface 4.5 body copy on a raised surface */
+/* @contrast --ink-secondary --bg-canvas 4.5 nav labels, field labels */
+/* @contrast --ink-secondary --bg-surface 4.5 nav labels on the header */
+/* @contrast --ink-secondary --bg-sunken 4.5 secondary text on the footer */
+/* @contrast --ink-muted --bg-canvas 4.5 meta lines, helper text, captions */
+/* @contrast --ink-muted --bg-sunken 4.5 footer meta */
+
+/* links */
+/* @contrast --link-ink --bg-canvas 4.5 inline link text */
+/* @contrast --link-ink --bg-surface 4.5 inline link on a raised surface */
+
+/* the filled button */
+/* @contrast --ink-on-accent --accent-base 4.5 primary button label */
+/* @contrast --ink-on-accent --accent-hover 4.5 primary button label, hover */
+/* @contrast --ink-on-accent --accent-press 4.5 primary button label, press */
+
+/* the quiet accent: a selected filter */
+/* @contrast --accent-quiet-ink --accent-quiet-bg 4.5 selected filter chip label */
+/* @contrast --accent-quiet-ink --bg-surface 4.5 selected chip ink if the wash is absent */
+/* @contrast --accent-quiet-edge --bg-surface 3 selected chip boundary on the page */
+/* @contrast --accent-quiet-edge --bg-canvas 3 selected chip boundary on the ground */
+
+/* meta on a raised surface (catalog cards, chapter rows) */
+/* @contrast --ink-muted --bg-surface 4.5 card meta line on the app surface */
+
+/* form errors */
+/* @contrast --danger-ink --bg-surface 4.5 inline validation message */
+/* @contrast --danger-ink --danger-bg 4.5 error message on its own panel */
+
+/* chrome */
+/* @contrast --ink-chrome --bg-chrome 4.5 skip link label on the dark bar */
+
+/* non-text: control boundaries (SC 1.4.11, 3:1) */
+/* @contrast --line-control --bg-surface 3 input and button border */
+/* @contrast --line-control --bg-canvas 3 control border on the app ground */
+/* @contrast --accent-base --bg-canvas 3 filled button against the ground */
+/* @contrast --accent-base --bg-surface 3 filled button on a raised surface */
+
+/* non-text: the focus indicator, painted the way it is drawn */
+/* @contrast --focus-outer --bg-canvas 3 outer band on the app ground */
+/* @contrast --focus-outer --bg-surface 3 outer band on the header surface */
+/* @contrast --focus-outer --bg-sunken 3 outer band on the footer */
+/* @contrast --focus-inner --accent-base 3 inner band on the filled button */
+/* @contrast --focus-inner-on-dark --bg-chrome 3 inner band on the skip link */
+
+/* exemptions, each with the reason it carries no minimum */
+/* @contrast-exempt --line-hairline decoration: it separates regions that
+     their own text already identifies, so SC 1.4.11 does not apply. */
+
+/* Depth: no shadow token is defined in this phase, because the primitives
+     that would use one are skeletons. A task that needs one adds it here with
+     its pairs — never as a colour literal in a component stylesheet. */
+
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+/* Non-colour tokens. Same file, same reason: one place to look, and no
+   component invents its own spacing. 4px grid; the reader's own numbers are
+   absolute pixels and live with the reader. */
+:root {
+  /* Type. No webfont is bundled (nothing is fetched at runtime); personality
+     comes from the pairing — an old-style serif for titles, the platform UI
+     sans for chrome, a mono for figures that must align in a column. */
+  --font-display:
+    'Iowan Old Style', 'Hoefler Text', 'Palatino Linotype', Palatino, 'Book Antiqua',
+    'URW Palladio L', Georgia, 'Yu Mincho', 'Hiragino Mincho ProN', 'Noto Serif', serif;
+  --font-ui:
+    system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'SFMono-Regular', 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'Noto Sans Mono',
+    monospace;
+
+  --fs-xs: 0.75rem; /* 12 — badges and table micro-labels only */
+  --fs-sm: 0.8125rem; /* 13 — labels, helper text, nav */
+  --fs-md: 0.9375rem; /* 15 — dense table body, meta rows */
+  --fs-base: 1rem; /* 16 — body copy, never smaller */
+  --fs-lg: 1.25rem; /* 20 — card titles on small screens */
+  --fs-xl: 1.75rem; /* 28 — section headings, page title on mobile */
+  --fs-2xl: 2.25rem; /* 36 — page title on desktop */
+  --fs-3xl: 2.75rem; /* 44 — a manga title, and nothing else */
+
+  --lh-tight: 1.18;
+  --lh-snug: 1.35;
+  --lh-normal: 1.55;
+  --lh-relaxed: 1.7;
+
+  --tracking-tight: -0.017em;
+  --tracking-wide: 0.03em;
+  --tracking-caps: 0.08em;
+
+  /* Spacing — a 4px grid, no exceptions. */
+  --sp-1: 0.25rem;
+  --sp-2: 0.5rem;
+  --sp-3: 0.75rem;
+  --sp-4: 1rem;
+  --sp-5: 1.25rem;
+  --sp-6: 1.5rem;
+  --sp-8: 2rem;
+  --sp-10: 2.5rem;
+  --sp-12: 3rem;
+  --sp-16: 4rem;
+
+  /* Radius — concentric: a control nested in a container is never more
+     rounded than the container around it. */
+  --r-xs: 3px;
+  --r-sm: 5px;
+  --r-md: 7px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-pill: 999px;
+
+  /* The product sets 44px. WCAG 2.1 SC 2.5.8 AA would allow 24; the product
+     commits to the higher number and every control honours it. */
+  --target-min: 44px;
+
+  /* Motion is functional and short. The only page-turn transition is named
+     for that job, because it is the one that must stay cancellable. */
+  --dur-instant: 0ms;
+  --dur-fast: 110ms;
+  --dur-page: 120ms;
+  --dur-slow: 220ms;
+  --ease-out: cubic-bezier(0.16, 0.84, 0.44, 1);
+  --ease-page: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Layout */
+  --page-max: 1240px;
+  --measure: 68ch;
+  --header-h: 3.5rem;
+}

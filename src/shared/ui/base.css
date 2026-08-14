@@ -1,0 +1,597 @@
+/*
+ * Yomi — base styles for the shell and the shared primitives.
+ *
+ * No colour is written here: every colour is `var(--token)` from tokens.css,
+ * the only place a colour value is allowed to exist. If a value is needed that
+ * no token carries, the fix is a new token with a measured contrast pair — not
+ * a literal. Scope: the shell (header, nav, main, footer) plus the primitives.
+ * Feature styling belongs to the features, on top of these tokens.
+ */
+
+/* Document */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-canvas);
+  color: var(--ink-primary);
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  -webkit-font-smoothing: antialiased;
+  /* The 320px floor is the narrowest supported viewport; nothing may push the
+     page sideways. */
+  overflow-x: hidden;
+}
+
+img,
+svg,
+video {
+  max-width: 100%;
+  height: auto;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+figure,
+blockquote {
+  margin: 0;
+}
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+:focus {
+  outline: none;
+}
+
+/* The two-band indicator, painted the way tokens.css declares it: the outer
+   band sits on the surround, and an inner band is added only where the
+   control's own fill contrasts with that surround (see .btn--primary and
+   .skip-link below). */
+:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+}
+
+/* A sticky header must never sit on top of the element that just received
+   focus or a fragment target (WCAG 2.2 SC 2.4.11 — focus not obscured). */
+:target,
+[id] {
+  scroll-margin-block-start: calc(var(--header-h) + var(--sp-2));
+  scroll-margin-block-end: var(--sp-8);
+}
+
+/* Type */
+
+h1,
+.h1 {
+  font-family: var(--font-display);
+  font-size: var(--fs-2xl);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-tight);
+  text-wrap: balance;
+}
+
+h2,
+.h2 {
+  font-family: var(--font-display);
+  font-size: var(--fs-xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tracking-tight);
+  text-wrap: balance;
+}
+
+h3,
+.h3 {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  line-height: var(--lh-snug);
+}
+
+a {
+  color: var(--link-ink);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  text-decoration-color: var(--line-control);
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A programmatically focused region — the not-found and error states. It is a
+   block element, so the generic control ring would draw a hard box around the
+   entire content column; the measure keeps the ring on the words it is
+   announcing. The ring itself is the standard one (--focus-outer, offset so it
+   never touches the text). */
+.focus-region {
+  max-width: var(--measure);
+}
+
+.focus-region:focus-visible {
+  outline: 2px solid var(--focus-outer);
+  outline-offset: var(--sp-2);
+}
+
+/* A line of secondary information under a statement (an error reference, a
+   page-level notice). Never the only place something is said. */
+.note {
+  font-size: var(--fs-sm);
+  color: var(--ink-muted);
+}
+
+/* A page state: the heading that names it, the cause, the next action, and where to go.
+   Left-aligned and measured rather than centred — a state is something to read, and
+   `.state-region` is the single definition behind not-found, error, the catalog and detail
+   unavailability, and every route that is still a shell. */
+.state-region {
+  display: grid;
+  gap: var(--sp-3);
+  justify-items: start;
+  max-width: var(--measure);
+  padding-block: var(--sp-6);
+}
+
+.state-region code {
+  font-size: 0.95em;
+}
+
+/* A row of actions. Wraps, so it survives the 320px floor. */
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  margin-block-start: var(--sp-4);
+}
+
+/* Available to assistive technology, absent from the visual page. Used for
+   the nav landmark's extra context and for any control that carries its
+   label in an icon. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Skip link — the first focusable element in the document */
+
+.skip-link {
+  position: absolute;
+  inset-inline-start: var(--sp-3);
+  top: 0;
+  z-index: 60;
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+  padding-inline: var(--sp-4);
+  border-radius: 0 0 var(--r-md) var(--r-md);
+  background: var(--bg-chrome);
+  color: var(--ink-chrome);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  text-decoration: none;
+  /* Off-screen until focused — moved, never hidden, so it stays reachable
+     and keeps its place in the tab order. */
+  transform: translateY(-140%);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+  outline: 2px solid var(--focus-outer);
+  outline-offset: 2px;
+  /* Inner band: the skip link's own fill is the dark chrome bar in BOTH
+     themes, so this band is a fixed light one (tokens.css). */
+  box-shadow: 0 0 0 2px var(--focus-inner-on-dark);
+  border-radius: 0 0 var(--r-md) var(--r-md);
+}
+
+/* Shell */
+
+.shell-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg-surface);
+  border-block-end: 1px solid var(--line-hairline);
+}
+
+.shell-header__in {
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding: var(--sp-2) var(--sp-4);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  min-height: var(--target-min);
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink-primary);
+  text-decoration: none;
+}
+
+/* The wordmark's one flourish: a seal-coloured period. It marks the brand
+   and is the only place the accent touches the chrome. */
+.brand::after {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--accent-base);
+  align-self: center;
+}
+
+.shell-nav ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.shell-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+  padding-inline: var(--sp-3);
+  border-radius: var(--r-md);
+  color: var(--ink-secondary);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.shell-nav a:hover {
+  background: var(--bg-sunken);
+  color: var(--ink-primary);
+}
+
+/* "You are here" needs the session to be known; until it is, the rule is here
+   and unused, and the link set stays honest. */
+.shell-nav a[aria-current='page'] {
+  color: var(--ink-primary);
+  font-weight: 600;
+  background: var(--bg-sunken);
+}
+
+.shell-main {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding: var(--sp-6) var(--sp-4) var(--sp-16);
+}
+
+.shell-footer {
+  border-block-start: 1px solid var(--line-hairline);
+  background: var(--bg-sunken);
+  color: var(--ink-muted);
+  font-size: var(--fs-sm);
+}
+
+.shell-footer__in {
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding: var(--sp-6) var(--sp-4);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-6);
+}
+
+/* The admin sub-navigation is a real `nav` landmark inside the page, so it
+   is a band rather than a sidebar: the admin surface is dense tables, and a
+   band costs no horizontal space at 320px. */
+.admin-nav {
+  margin-block-end: var(--sp-6);
+  padding-block-end: var(--sp-3);
+  border-block-end: 1px solid var(--line-hairline);
+}
+
+.admin-nav ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px var(--sp-2);
+}
+
+.admin-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+  padding-inline: var(--sp-3);
+  border-radius: var(--r-md);
+  color: var(--ink-secondary);
+  font-size: var(--fs-sm);
+  text-decoration: none;
+}
+
+.admin-nav a:hover {
+  background: var(--bg-sunken);
+  color: var(--ink-primary);
+}
+
+/* Primitives (documented skeletons — behaviour belongs to the owning task) */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  /* 44px minimum, on the small variant too. */
+  min-height: var(--target-min);
+  min-width: var(--target-min);
+  padding-inline: var(--sp-4);
+  border: 1px solid var(--line-control);
+  border-radius: var(--r-md);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.btn:hover {
+  background: var(--bg-sunken);
+}
+
+.btn--primary {
+  border-color: var(--accent-base);
+  background: var(--accent-base);
+  color: var(--ink-on-accent);
+}
+
+.btn--primary:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+.btn--primary:active {
+  border-color: var(--accent-press);
+  background: var(--accent-press);
+}
+
+/* The filled button's fill differs from its surround, so it earns the second
+   focus band: the outer one on the surround, this one on the fill. */
+.btn--primary:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-inner);
+}
+
+.btn[disabled],
+.btn[aria-disabled='true'] {
+  color: var(--ink-muted);
+  border-color: var(--line-hairline);
+  background: var(--bg-sunken);
+  cursor: not-allowed;
+}
+
+.field {
+  display: grid;
+  gap: var(--sp-1);
+}
+
+.field > label {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--ink-secondary);
+}
+
+.field input,
+.field select,
+.field textarea {
+  min-height: var(--target-min);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-control);
+  border-radius: var(--r-sm);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+}
+
+.field input:focus-visible,
+.field select:focus-visible,
+.field textarea:focus-visible {
+  border-color: var(--line-control);
+}
+
+.field__hint {
+  font-size: var(--fs-sm);
+  color: var(--ink-muted);
+}
+
+.field__error {
+  font-size: var(--fs-sm);
+  color: var(--danger-ink);
+}
+
+/* Errors are never colour alone: the field is marked aria-invalid, the
+   message is linked with aria-describedby and carries role="alert". */
+.field input[aria-invalid='true'],
+.field select[aria-invalid='true'],
+.field textarea[aria-invalid='true'] {
+  border-color: var(--danger-ink);
+}
+
+.field-error-summary {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px solid var(--danger-ink);
+  border-radius: var(--r-md);
+  background: var(--danger-bg);
+  color: var(--danger-ink);
+}
+
+.dialog {
+  padding: 0;
+  border: 1px solid var(--line-control);
+  border-radius: var(--r-xl);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  max-width: min(32rem, calc(100vw - var(--sp-8)));
+}
+
+.dialog::backdrop {
+  background: var(--bg-chrome);
+}
+
+.dialog__head {
+  padding: var(--sp-5) var(--sp-5) 0;
+}
+
+.dialog__body {
+  padding: var(--sp-3) var(--sp-5);
+}
+
+.dialog__foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-5) var(--sp-5);
+}
+
+.list > li + li {
+  border-block-start: 1px solid var(--line-hairline);
+}
+
+/* Narrow viewports (the 320px floor) */
+
+@media (max-width: 30rem) {
+  .shell-header__in {
+    padding-inline: var(--sp-3);
+  }
+
+  .shell-main {
+    padding-inline: var(--sp-3);
+  }
+
+  .shell-nav ul {
+    gap: 0;
+  }
+
+  .shell-nav a {
+    padding-inline: var(--sp-2);
+  }
+}
+
+/* Motion — no information is carried by motion in this shell, so collapsing
+   every transition loses nothing. */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .skip-link {
+    transition: none;
+  }
+}
+
+/* Forced colours (Windows High Contrast).
+ *
+ * The browser replaces the palette wholesale here, which is the point: the
+ * tokens stop mattering and the system palette takes over. What still needs
+ * author help is the information the palette was carrying:
+ *   - a boundary that was a colour now needs a border, or a control whose fill
+ *     equalled its ground becomes invisible;
+ *   - a filled control that carried white text must be re-expressed with
+ *     Highlight/HighlightText, or its label disappears;
+ *   - the two-band focus ring collapses to a single CanvasText band, because a
+ *     box-shadow is not painted in forced-colours mode.
+ * System colour keywords are used deliberately: they are the user's chosen
+ * palette, not colours this file defines.
+ */
+
+@media (forced-colors: active) {
+  .btn,
+  .field input,
+  .field select,
+  .field textarea,
+  .dialog,
+  .admin-nav a {
+    border: 1px solid CanvasText;
+  }
+
+  .btn--primary {
+    background: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+    forced-color-adjust: none;
+  }
+
+  .skip-link {
+    background: Canvas;
+    color: CanvasText;
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
+
+  :focus-visible {
+    outline: 2px solid CanvasText;
+  }
+
+  .skip-link:focus-visible {
+    outline: 2px solid Highlight;
+  }
+
+  .brand::after {
+    background: CanvasText;
+  }
+}
