@@ -1,0 +1,101 @@
+/**
+ * Search styles (`/search`).
+ *
+ * No colour is written here: every colour is a `var(--token)` from
+ * `src/shared/ui/tokens.css`, the only file in `src/` where a colour literal
+ * may appear. Badges and hints are words in bordered chips, so the information
+ * is never carried by colour alone. The buttons are the shared `.btn` (44 px)
+ * and the input is full-width with a 44 px minimum height.
+ */
+.stack {
+  display: grid;
+  gap: var(--sp-6);
+}
+
+.form {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.label {
+  font-weight: 600;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--sp-2);
+  align-items: stretch;
+}
+
+.input {
+  min-height: 44px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font: inherit;
+}
+
+.count {
+  margin: 0;
+}
+
+.state {
+  display: grid;
+  gap: var(--sp-3);
+  justify-items: start;
+  padding: var(--sp-4);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius);
+}
+
+.stateText {
+  margin: 0;
+}
+
+.query {
+  font-weight: 600;
+}
+
+.results {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  display: grid;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius);
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  align-items: center;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+}
+
+.hint {
+  font-size: 0.875rem;
+  color: var(--ink-muted);
+}
+
+.title {
+  font-weight: 600;
+  font-size: 1.125rem;
+}
