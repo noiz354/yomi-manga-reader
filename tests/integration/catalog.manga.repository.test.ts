@@ -1,14 +1,10 @@
 /**
  * Integration tests — MangaRepository against a REAL PostgreSQL 18.
  *
- * Cursor pagination stability with concurrent inserts; filters/sorts
- * correct; soft-deleted excluded. Keyset cursors (not OFFSET), index-backed
- * sorts (asserted via EXPLAIN), zero-chapter manga, and the single visibility
- * rule.
- *
- * NOTHING here asserts against a TypeScript type: every expectation reads rows
- * back out of a migrated database, and the EXPLAIN assertions read the
- * planner's own output.
+ * Every expectation reads rows back out of a migrated database, and the EXPLAIN
+ * assertions read the planner's own output — nothing asserts against a
+ * TypeScript type. Every title, synopsis, alias, creator and genre name here is
+ * generated test data.
  *
  * DSN: `DATABASE_URL`. SKIPS (never silently passes) when absent:
  *   docker run -d --name yomi-cat -e POSTGRES_USER=yomi -e POSTGRES_PASSWORD=yomi \
@@ -19,9 +15,6 @@
  * SAFETY: `beforeEach` TRUNCATEs every table — point this suite at a THROWAWAY
  * database, and never at the same database as a suite that seeds
  * (`vitest.config.ts` runs integration files in one fork).
- *
- * No product content: every title, synopsis, alias, creator and genre name here
- * is generated test data (generated test data only).
  */
 import { beforeAll, afterAll, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -49,7 +42,7 @@ const READER: CallerContext = {
   role: 'reader',
 };
 
-describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL 18', () => {
+describeDb('MangaRepository on a real PostgreSQL 18', () => {
   let harness: Harness;
   let manga: MangaRepository;
   /** Slug written for each fixture id, so `bySlug` can be addressed. */
@@ -87,8 +80,6 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     ...over,
   });
 
-  /* ── the visibility rule: ONE definition, proven here and against the SQL ── */
-
   describe('the visibility rule (features/manga — the single definition)', () => {
     it('is published && not deleted, and nothing else', () => {
       expect(isMangaVisible({ published: true, deletedAt: null })).toBe(true);
@@ -97,7 +88,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(isMangaVisible({ published: false, deletedAt: '2026-01-01T00:00:00.000Z' })).toBe(false);
     });
 
-    it('is stated as exactly the two DATA_MODEL §3 axes, in one clause list', () => {
+    it('is stated as exactly the two axes, in one clause list', () => {
       expect(MANGA_VISIBILITY_CLAUSES).toEqual([
         { column: 'published', equals: true },
         { column: 'deletedAt', equals: null },
@@ -145,10 +136,8 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── list: the visibility rule applied, ix_manga_visible named ──────────── */
-
   describe('list() — the catalog hot path', () => {
-    it('returns only published, non-deleted manga (NFR-DATA-002)', async () => {
+    it('returns only published, non-deleted manga', async () => {
       const visible = await createManga(harness, slugs, { published: true });
       const draft = await createManga(harness, slugs, { published: false });
       const removed = await createManga(harness, slugs, { published: true, deleted: true });
@@ -159,7 +148,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(found).not.toContain(removed);
     });
 
-    it('includes a manga with zero chapters, with latestChapter null (FR-CATALOG-005)', async () => {
+    it('includes a manga with zero chapters, with latestChapter null', async () => {
       const id = await createManga(harness, slugs, { published: true });
       const item = (await manga.list({})).items.find((entry) => entry.id === id);
       expect(item).toBeDefined();
@@ -167,7 +156,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(item?.coverUrl).toBeNull();
     });
 
-    it('reports the latest PUBLISHED chapter and never a draft (FR-CHAPTER-002)', async () => {
+    it('reports the latest PUBLISHED chapter and never a draft', async () => {
       const mangaId = await createManga(harness, slugs, { published: true });
       const chapters = createChapterRepository(harness.db);
       const published = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
@@ -179,14 +168,16 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(item?.latestChapter?.number).toBe(1);
     });
 
-    it('builds an app-relative cover URL, never a storage URL (FR-MEDIA-003)', async () => {
+    it('builds an app-relative cover URL, never a storage URL', async () => {
       const id = await createManga(harness, slugs, { published: true });
-      await manga.setCover(id, 'seed/v1/cover/abcdef0123456789');
+      await manga.setCover(id, 'abcdef0123456789abcdef0123456789');
       const item = (await manga.list({})).items.find((entry) => entry.id === id);
-      expect(item?.coverUrl).toBe('/media/seed/v1/cover/abcdef0123456789');
+      // The JPEG delivery URL for the stored base key: the extension selects
+      // the variant the delivery grammar requires.
+      expect(item?.coverUrl).toBe('/media/abcdef0123456789abcdef0123456789.jpeg');
     });
 
-    it('honours the status filter (FR-CATALOG-003)', async () => {
+    it('honours the status filter', async () => {
       const ongoing = await createManga(harness, slugs, { published: true, status: 'ongoing' });
       const completed = await createManga(harness, slugs, { published: true, status: 'completed' });
       const found = (await manga.list({ status: 'completed' })).items.map((item) => item.id);
@@ -194,13 +185,13 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(found).not.toContain(ongoing);
     });
 
-    it('ignores an unknown genre slug instead of erroring (T-CATALOG-002 edge case)', async () => {
+    it('ignores an unknown genre slug instead of erroring (edge case)', async () => {
       const id = await createManga(harness, slugs, { published: true });
       const found = (await manga.list({ genres: ['no-such-genre'] })).items.map((item) => item.id);
       expect(found).toContain(id);
     });
 
-    it('filters by genre case-insensitively, for ANY of the selected genres (FR-CATALOG-002)', async () => {
+    it('filters by genre case-insensitively, for ANY of the selected genres', async () => {
       const [action, drama] = genrePair(await insertGenres(harness, ['Action', 'Drama']));
       const tagged = await createManga(harness, slugs, { published: true, genreIds: [action] });
       const other = await createManga(harness, slugs, { published: true, genreIds: [drama] });
@@ -211,7 +202,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(found).not.toContain(untagged);
     });
 
-    it('caps the page at 48 and defaults to 24 (API_CONTRACT §2.1)', async () => {
+    it('caps the page at 48 and defaults to 24', async () => {
       for (let index = 0; index < 60; index += 1) await createManga(harness, slugs, { published: true });
       expect((await manga.list({})).items).toHaveLength(24);
       expect((await manga.list({ limit: 48 })).items).toHaveLength(48);
@@ -219,9 +210,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── the three sorts: each index-backed, each named in a comment ────────── */
-
-  describe('sorts use indexes (EXPLAIN gate)', () => {
+  describe('sorts (the EXPLAIN gate)', () => {
     it('title_asc orders by title', async () => {
       const bravo = await createManga(harness, slugs, { published: true, title: 'Bravo' });
       const alpha = await createManga(harness, slugs, { published: true, title: 'Alpha' });
@@ -283,9 +272,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── cursor stability: keyset, not OFFSET ──────────────────────────────── */
-
-  describe('keyset cursor stability (T-CATALOG-001 edge case)', () => {
+  describe('keyset cursor stability (edge case)', () => {
     it('a row inserted BETWEEN pages neither skips nor repeats anything', async () => {
       // Six titles whose updatedAt FALLS with the name, so the catalog order
       // (`updated_desc`, newest first) is known: a, b, c, d, e, f.
@@ -413,7 +400,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(page.nextCursor).toBeNull();
     });
 
-    it('an empty result is `{ items: [], nextCursor: null }` (T-CATALOG-002 edge case)', async () => {
+    it('an empty result is `{ items: [], nextCursor: null }` (edge case)', async () => {
       expect(await manga.list({ status: 'hiatus' })).toEqual({ items: [], nextCursor: null });
     });
 
@@ -427,10 +414,8 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── adminList: the admin flag is the ONLY way to see hidden rows ──────── */
-
   describe('adminList()', () => {
-    it('includes drafts but NOT soft-deleted rows by default (FR-ADMIN-001/003)', async () => {
+    it('includes drafts but NOT soft-deleted rows by default', async () => {
       const visible = await createManga(harness, slugs, { published: true });
       const draft = await createManga(harness, slugs, { published: false });
       const removed = await createManga(harness, slugs, { published: true, deleted: true });
@@ -487,8 +472,6 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── bySlug: 404-shaped for hidden ─────────────────────────────────────── */
-
   describe('bySlug()', () => {
     it('returns the detail for a visible manga to an anonymous caller', async () => {
       const id = await createManga(harness, slugs, { published: true });
@@ -502,12 +485,12 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(await manga.bySlug(slug, READER)).toBeNull();
     });
 
-    it('is NOT null for a draft to an admin (FR-ADMIN-001: drafts are admin-readable)', async () => {
+    it('is NOT null for a draft to an admin (drafts are admin-readable)', async () => {
       const id = await createManga(harness, slugs, { published: false });
       expect(await manga.bySlug(slugs.get(id) as MangaSlug, ADMIN)).not.toBeNull();
     });
 
-    it('is null for a soft-deleted manga to EVERYONE (FR-ADMIN-003)', async () => {
+    it('is null for a soft-deleted manga to EVERYONE', async () => {
       const id = await createManga(harness, slugs, { published: true, deleted: true });
       const slug = slugs.get(id) as MangaSlug;
       expect(await manga.bySlug(slug, null)).toBeNull();
@@ -518,7 +501,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(await manga.bySlug('nothing-here' as MangaSlug, null)).toBeNull();
     });
 
-    it('reports chapterCount, firstChapter and latestChapter in reading order (FR-CATALOG-007)', async () => {
+    it('reports chapterCount, firstChapter and latestChapter in reading order', async () => {
       const id = await createManga(harness, slugs, { published: true });
       const chapters = createChapterRepository(harness.db);
       const first = await chapters.create({ mangaId: id, number: 1, title: 'first', notes: '' });
@@ -532,8 +515,6 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       expect(detail?.latestChapter?.title).toBe('second');
     });
   });
-
-  /* ── writes ────────────────────────────────────────────────────────────── */
 
   describe('create / update / setPublished / softDelete / restore / count', () => {
     it('create() writes the row and every link, and is readable straight back', async () => {
@@ -570,7 +551,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       }
     });
 
-    it('create() leaves the title a DRAFT until setPublished (FR-ADMIN-001 → FR-CHAPTER-002)', async () => {
+    it('create() leaves the title a DRAFT until setPublished', async () => {
       const id = await manga.create(draftInput({ slug: `draft-${counter++}` as MangaSlug }));
       expect((await manga.list({})).items.map((i) => i.id)).not.toContain(id);
       await manga.setPublished(id, true);
@@ -583,7 +564,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
       await expect(manga.create(input)).rejects.toThrowError(/^Slug already in use\.$/);
     });
 
-    it('create() upserts a creator by NAME, so a second manga reuses the row (DATA_MODEL §5)', async () => {
+    it('create() upserts a creator by NAME, so a second manga reuses the row', async () => {
       const creators = [{ name: 'Shared Writer', role: 'author' as const }];
       const first = await manga.create(draftInput({ slug: 'creator-a' as MangaSlug, creators }));
       const second = await manga.create(draftInput({ slug: 'creator-b' as MangaSlug, creators }));
@@ -643,13 +624,15 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     it('setCover() writes and clears the cover key', async () => {
       const id = await createManga(harness, slugs, { published: true });
       const slug = slugs.get(id) as MangaSlug;
-      await manga.setCover(id, 'seed/v1/cover/aaa');
-      expect((await manga.bySlug(slug, null))?.coverUrl).toBe('/media/seed/v1/cover/aaa');
+      await manga.setCover(id, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+      expect((await manga.bySlug(slug, null))?.coverUrl).toBe(
+        '/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpeg',
+      );
       await manga.setCover(id, null);
       expect((await manga.bySlug(slug, null))?.coverUrl).toBeNull();
     });
 
-    it('count() counts every row, soft-deleted included (FR-ADMIN-008 stats)', async () => {
+    it('count() counts every row, soft-deleted included (stats)', async () => {
       expect(await manga.count()).toBe(0);
       await createManga(harness, slugs, { published: true });
       await createManga(harness, slugs, { published: false });
@@ -658,9 +641,7 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── parameterisation: the one trust boundary in this module ───────────── */
-
-  describe('queries are parameterised', () => {
+  describe('parameterised only', () => {
     it('a SQL payload in a title, alias, status or genre slug is inert data', async () => {
       const payload = "'; drop table manga; --";
       const id = await manga.create(
@@ -672,9 +653,9 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
           creators: [{ name: payload, role: 'author' }],
         }),
       );
-      // `create()` leaves a DRAFT (FR-ADMIN-001), and an unknown genre slug is
-      // IGNORED rather than an error (API_CONTRACT §2.1) — so this list is the
-      // unfiltered catalog containing the published title, not an empty page.
+      // `create()` leaves a DRAFT, and an unknown genre slug is IGNORED rather
+      // than an error — so this list is the unfiltered catalog containing the
+      // published title, not an empty page.
       await manga.setPublished(id, true);
       const listed = (await manga.list({ genres: [payload] })).items;
       expect(listed.map((i) => i.id)).toEqual([id]);
@@ -685,12 +666,10 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 
-  /* ── the EXPLAIN gate: named indexes, no seq scan at 10k rows ──────────── */
-
-  describe('hot queries use indexes (EXPLAIN gate)', () => {
+  describe('EXPLAIN gate', () => {
     it('every catalog shape uses its named index and never a seq scan at 10k rows', async () => {
-      // T-PERF-004's own threshold: "no seq scan > 10k rows". The corpus is
-      // generated here (not seeded) so the assertion is about the query.
+      // The threshold: "no seq scan > 10k rows". The corpus is generated here
+      // (not seeded) so the assertion is about the query.
       await seedVisibleCorpus(harness, 10_000);
 
       const cases: { name: string; index: string; query: CatalogQuery }[] = [
@@ -756,8 +735,6 @@ describeDb('INT-CAT-001 / T-CATALOG-001 — MangaRepository on a real PostgreSQL
     });
   });
 });
-
-/* ── fixture writers (generated test data only) ─────────── */
 
 let fixtureSeq = 0;
 

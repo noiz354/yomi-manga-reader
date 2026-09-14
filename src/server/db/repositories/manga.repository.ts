@@ -1,7 +1,10 @@
 /**
- * Manga reads and writes. Visibility is defined once in features/manga and
- * rendered into SQL here, never restated. Pagination is keyset on
- * (sort key, id); a page hydrates in a fixed number of round trips.
+ * server/db/repositories/manga.repository — the `MangaRepository` port against
+ * PostgreSQL; with `chapter.repository.ts`, the only place the catalog's SQL lives.
+ * The single visibility rule (`isMangaVisible`) is rendered from the exported
+ * clause list, never restated, so a third visibility axis is added in one place.
+ * Pagination is keyset: a cursor carries the (sortKey, id) of the previous page's
+ * last row, and `id` is in every cursor because no sort key is unique.
  */
 import { and, count, desc, eq, exists, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import {
@@ -23,6 +26,7 @@ import type {
   Tag,
 } from '../../../shared/contracts';
 import type { MangaId, MangaSlug } from '../../../shared/types';
+import { mediaUrlFor } from '../../../shared/storage-keys';
 import type { Db } from '../client';
 import {
   chapter,
@@ -36,15 +40,13 @@ import {
   tag,
 } from '../schema';
 
-/* ── limits ────────────────────────────────────────────────────────────────── */
-
 /** The catalog page size when the caller names none. */
 export const CATALOG_DEFAULT_LIMIT = 24;
 
-/** The hard page cap: the contract allows no more (≤ 48). */
+/** The hard page cap: no more than 48. */
 export const CATALOG_MAX_LIMIT = 48;
 
-/** The genre filter cap: "≤ 5 slugs" (API_CONTRACT §2.1). */
+/** The genre filter cap: at most 5 slugs. */
 export const CATALOG_MAX_GENRES = 5;
 
 /**
@@ -56,8 +58,6 @@ type Executor = Pick<
   Db,
   'select' | 'selectDistinctOn' | 'insert' | 'update' | 'delete'
 >;
-
-/* ── the visibility rules, RENDERED (never restated) ─────────────────────── */
 
 /** A column object, so a table of sort specs can hold columns of mixed types. */
 type AnyColumn = Parameters<typeof isNull>[0];
@@ -77,9 +77,9 @@ function renderVisibilityClause(clause: MangaVisibilityClause): SQL {
  * The WHERE fragment that applies `isMangaVisible`: `published = true AND
  * deleted_at IS NULL`.
  *
- * Exported because the chapter reads need the same rule (a chapter of a hidden
- * manga is unreadable, FR-CHAPTER-002) and because INT-CAT-001 EXPLAINs and
- * cross-checks it against the predicate.
+ * Exported because the chapter reads need the same rule — a chapter of a hidden
+ * manga is unreadable — and because the gate EXPLAINs and cross-checks it
+ * against the predicate.
  */
 export function mangaVisibleWhere(): SQL {
   return sql`${sql.join(
@@ -89,11 +89,10 @@ export function mangaVisibleWhere(): SQL {
 }
 
 /**
- * The chapter visibility filter (FR-CHAPTER-002), rendered once for the whole
- * persistence layer.
+ * The chapter visibility filter, rendered once for the whole persistence layer.
  *
  * - a reader sees published, undeleted chapters;
- * - an admin sees drafts too (FR-ADMIN-001) but never a soft-deleted one.
+ * - an admin sees drafts too but never a soft-deleted one.
  *
  * It does NOT include the manga-side rule: a chapter is readable only through
  * its title, so callers that start from a chapter id join `manga` and add
@@ -107,24 +106,21 @@ export function chapterVisibleWhere(includeDrafts: boolean): SQL {
     : and(isNull(chapter.deletedAt), eq(chapter.status, 'published')) as SQL;
 }
 
-/** True when this caller may read drafts (FR-ADMIN-001). */
+/** True when this caller may read drafts. */
 export function mayReadDrafts(caller: CallerContext): boolean {
   return caller?.role === 'admin';
 }
 
 /**
  * The WHERE clauses a read-by-id applies for a caller: never a soft-deleted row
- * (FR-ADMIN-003 hides it from everyone, admin included), plus the full
- * visibility rule for everyone who is not an admin (FR-ADMIN-001 makes a draft
- * admin-readable).
+ * (hidden from everyone, admin included), plus the full visibility rule for
+ * everyone who is not an admin (a draft is admin-readable).
  */
 export function mangaReadClauses(caller: CallerContext): SQL[] {
   return mayReadDrafts(caller)
     ? [isNull(manga.deletedAt)]
     : [isNull(manga.deletedAt), mangaVisibleWhere()];
 }
-
-/* ── cursors ─────────────────────────────────────────────────────────────── */
 
 type CatalogSort = NonNullable<CatalogQuery['sort']>;
 
@@ -174,7 +170,7 @@ const SORTS: Record<
   },
 };
 
-/** The default sort: "recently updated first" (API_CONTRACT §2.1). */
+/** The default sort: "recently updated first". */
 const DEFAULT_SORT: CatalogSort = 'updated_desc';
 
 /** The sort a query asks for; anything unrecognised falls back to the default. */
@@ -182,7 +178,7 @@ function resolveSort(sort: CatalogSort | undefined): CatalogSort {
   return sort !== undefined && Object.hasOwn(SORTS, sort) ? sort : DEFAULT_SORT;
 }
 
-/** Clamps `limit` into `[1, 48]` (API_CONTRACT §2.1 "≤ 48"). */
+/** Clamps `limit` into `[1, 48]`. */
 function resolveLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return CATALOG_DEFAULT_LIMIT;
   return Math.min(Math.max(Math.trunc(limit), 1), CATALOG_MAX_LIMIT);
@@ -191,10 +187,9 @@ function resolveLimit(limit: number | undefined): number {
 /**
  * Encodes a cursor: base64url so it survives a query string unescaped.
  *
- * Opaque to callers (API_CONTRACT §2.1 types it as an opaque string) and NOT a
- * security token — it carries no authority. {@link decodeCursor} validates the
- * shape before any value is bound, so a hostile cursor is data, never SQL
- * (NFR-SEC-015).
+ * Opaque to callers and NOT a security token — it carries no authority.
+ * {@link decodeCursor} validates the shape before any value is bound, so a
+ * hostile cursor is data, never SQL.
  */
 function encodeCursor(sort: CatalogSort, key: string, id: string): string {
   const payload: CatalogCursor = { v: 1, s: sort, k: key, i: id };
@@ -232,8 +227,6 @@ function cursorArgs(cursor: string, sort: CatalogSort): [string, string] {
   return [decoded.k, decoded.i];
 }
 
-/* ── row shapes and row → DTO mapping (data-flow.md §7) ──────────────────── */
-
 /** The scalar columns every manga-shaped read projects. */
 const MANGA_COLUMNS = {
   id: manga.id,
@@ -260,10 +253,17 @@ interface MangaRow {
 }
 
 /**
- * Cover URL, null passthrough.
+ * The card/detail cover URL, built by the single rule in
+ * `shared/storage-keys.ts` (`mediaUrlFor`) — app-relative, never a storage
+ * URL.
+ *
+ * The variant is JPEG, deliberately: a cover is consumed by ONE `<img>`
+ * (there is no per-cover `<picture>` ladder), covers are stored WebP + JPEG
+ * only, and JPEG decodes everywhere the reader runs. A row with no cover key
+ * stays `null`, which the client renders as the placeholder.
  */
 function coverUrlOf(coverAssetKey: string | null): string | null {
-  return coverAssetKey === null ? null : `/media/${coverAssetKey}`;
+  return coverAssetKey === null ? null : mediaUrlFor(coverAssetKey, 'jpeg');
 }
 
 function asMangaStatus(value: string): MangaStatus {
@@ -274,12 +274,12 @@ function asReadingDirection(value: string): ReadingDirection {
   return value === 'ltr' ? 'ltr' : 'rtl';
 }
 
-/** `numeric(8,2)` arrives as a string; the DTOs say `number` (ADR-003 R2). */
+/** `numeric(8,2)` arrives as a string; the DTOs say `number`. */
 function asNumber(value: string | number): number {
   return typeof value === 'number' ? value : Number(value);
 }
 
-/** timestamptz → ISO-8601 UTC (NFR-DATA-006). */
+/** timestamptz → ISO-8601 UTC. */
 function asIso(value: Date): string {
   return value.toISOString();
 }
@@ -292,8 +292,8 @@ interface LatestChapter {
 }
 
 /**
- * Shapes one latest-chapter row. `null` — the zero-chapter manga case of
- * T-CATALOG-001 — is the ABSENCE of a row in the batch, not a property of one.
+ * Shapes one latest-chapter row. `null` — the zero-chapter manga case — is the
+ * ABSENCE of a row in the batch, not a property of one.
  *
  * `publishedAt` is non-null in the DTO. A published chapter always has the
  * stamp (`setPublished` writes it), so the `createdAt` fallback is defensive
@@ -351,13 +351,10 @@ function toDetail(row: MangaRow, latest: LatestChapter | null, extras: DetailExt
     tags: extras.tags,
     createdAt: asIso(row.createdAt),
     // `continueReading` is deliberately absent: it is the READER's own position
-    // and belongs to ReaderProgressRepository (another lane).
-    // The contract marks it optional for exactly that reason (FR-CATALOG-008),
-    // and the service that owns both ports fills it in.
+    // and belongs to ReaderProgressRepository. The contract marks it optional
+    // for exactly that reason, and the service that owns both ports fills it in.
   };
 }
-
-/* ── driver-error classification ─────────────────────────────────────────── */
 
 /**
  * A postgres.js unique violation carries `23505` and, when the driver reports
@@ -381,13 +378,35 @@ function isUniqueViolation(error: unknown, constraint: string): boolean {
   return false;
 }
 
-/* ── query builders (one definition each; the factory and the gate share them) */
-
 /**
- * THE genre-slug rule, as SQL: the filter carries slugs while the table
- * holds names, so the slug is derived identically on both sides of the wire.
- * A name comparison silently matches nothing for multi-word genres, which
- * would answer the whole catalog under a filter.
+ * THE genre-slug rule, as SQL.
+ *
+ * The public filter carries "genre slugs" (`?genre=action,drama`) while the
+ * model gives a genre only a `name` and no slug column. The slug is therefore
+ * DERIVED, and it must be derived the same way on both sides of the wire: the
+ * service derives it in TypeScript (`normaliseGenreSlug`) and the query derives
+ * it again here.
+ *
+ * Why the derivation lives in SQL rather than being sent as a name: the client
+ * sends whatever the facets endpoint gave it, and comparing a slug against a
+ * name only works for single-word genres. `Slice of Life` slugifies to
+ * `slice-of-life`, and no `lower(name)` equals that — so a name comparison
+ * silently matched nothing, the genre predicate was dropped, and the endpoint
+ * answered with the WHOLE catalog under a filter. That is a filter that lies,
+ * which is worse than one that returns nothing.
+ *
+ * `ix_genres_name` is a plain btree and the vocabulary is ~20 rows, so
+ * evaluating this expression is a scan of a controlled set, not a table walk;
+ * the catalog read itself is index-backed on the manga side.
+ *
+ * ONE definition, two consumers: the test harness imports this instead of
+ * carrying its own copy, so the tested query and the shipped query cannot
+ * diverge again.
+ *
+ * @param column the `genre.name` (or `tag.name`) column
+ * @returns a SQL fragment evaluating to that name's slug, typed so a
+ *   `.select({ slug: genreSlugSql(col) })` yields a `string` rather than
+ *   `unknown`
  */
 export function genreSlugSql(column: AnyColumn): SQL<string> {
   return sql`trim(both '-' from regexp_replace(lower(btrim(${column})), '[^a-z0-9]+', '-', 'g'))`;
@@ -396,12 +415,12 @@ export function genreSlugSql(column: AnyColumn): SQL<string> {
 /**
  * Resolves genre slugs to ids, DROPPING the ones that do not exist.
  *
- * An unknown slug is IGNORED, not an error (API_CONTRACT §2.1). When EVERY slug
- * is unknown no genre filter is applied at all — which is the documented
- * behaviour for "a filter value that names nothing", and the reason
- * INT-CAT-004 pins the resolved case separately: a slug that SHOULD have
- * resolved and did not is indistinguishable from "no filter" here, so the
- * per-genre cases are asserted on rows.
+ * An unknown slug is IGNORED, not an error. When EVERY slug is unknown no genre
+ * filter is applied at all — which is the documented behaviour for "a filter
+ * value that names nothing", and the reason the gate pins the resolved case
+ * separately: a slug that SHOULD have resolved and did not is
+ * indistinguishable from "no filter" here, so the per-genre cases are asserted
+ * on rows.
  */
 async function resolveGenreIds(db: Db, names: string[] | undefined): Promise<string[]> {
   if (names === undefined || names.length === 0) return [];
@@ -523,7 +542,7 @@ async function latestChapters(
  * The manga side of each join is served by the leading column of
  * `ix_manga_alias_manga_id_alias` / `ix_manga_genre_genre_id` /
  * `ix_manga_tag_tag_id` / `ix_manga_creator_creator_id`; the two chapter
- * aggregates by `ix_chapters_manga_order` (NFR-PERF-014).
+ * aggregates by `ix_chapters_manga_order`.
  */
 async function loadExtras(
   executor: Executor,
@@ -601,9 +620,9 @@ async function loadExtras(
 }
 
 /**
- * Upserts creators BY NAME and returns `{ id, role }` links (DATA_MODEL §5:
- * `name` is the creator's unique identity, and the port's create/update input
- * names a creator rather than carrying a creator id).
+ * Upserts creators BY NAME and returns `{ id, role }` links (the creator's
+ * `name` is its unique identity, and the port's create/update input names a
+ * creator rather than carrying a creator id).
  */
 async function upsertCreators(
   executor: Executor,
@@ -683,13 +702,11 @@ async function relink(
 /** The `sql\`now()\`` stamp, so a write bumps `updated_at` like the DEFAULT would. */
 const TOUCHED_AT = sql`now()`;
 
-/* ── the repository ──────────────────────────────────────────────────────── */
-
 /**
  * Builds the Drizzle `MangaRepository`.
  *
  * @param db the application's handle from `createDb(env)` — the only place a
- *   connection is ever needed (ADR-003, dependency rule D2).
+ *   connection is ever needed.
  */
 export function createMangaRepository(db: Db): MangaRepository {
   /** The (items, nextCursor) shape both paged methods return. */
@@ -742,7 +759,7 @@ export function createMangaRepository(db: Db): MangaRepository {
       const rows = (await buildAdminListQuery(db, query)) as MangaRow[];
       const page = rows.slice(0, limit);
       const ids = page.map((row) => row.id);
-      // An admin sees drafts, so the chapter side does too (FR-ADMIN-001).
+      // An admin sees drafts, so the chapter side does too.
       const [latest, extras] = await Promise.all([latestChapters(db, ids, true), detailsFor(page, true)]);
       return pageOf(rows, sort, limit, (row) =>
         toDetail(row, latest.get(row.id) ?? null, extras.get(row.id) ?? emptyExtras()),
@@ -750,10 +767,10 @@ export function createMangaRepository(db: Db): MangaRepository {
     },
 
     /**
-     * One title by row id (`POST /api/library` must 404 an unknown
-     * `mangaId` rather than let the foreign key raise a bare 500). The same
-     * visibility clauses as `bySlug`, so a draft or deleted title reads as "not
-     * found" rather than "forbidden" — a 403 would tell a reader which ids exist.
+     * One title by row id — `POST /api/library` must 404 an unknown `mangaId`
+     * rather than let the foreign key raise a bare 500. The same visibility
+     * clauses as `bySlug`, so a draft or deleted title reads as "not found"
+     * rather than "forbidden" — a 403 would tell a reader which ids exist.
      */
     async byId(id: MangaId, caller: CallerContext): Promise<MangaSummary | null> {
       const [row] = (await db
@@ -773,7 +790,7 @@ export function createMangaRepository(db: Db): MangaRepository {
         .from(manga)
         .where(and(eq(manga.slug, slug), ...mangaReadClauses(caller)))) as MangaRow[];
       // 404-shaped, never 403: a draft and a deleted title are indistinguishable
-      // from a slug that never existed (FR-ADMIN-003, EC-ADM-07).
+      // from a slug that never existed.
       if (row === undefined) return null;
       const [latest, extras] = await Promise.all([
         latestChapters(db, [row.id], mayReadDrafts(caller)),
@@ -806,9 +823,8 @@ export function createMangaRepository(db: Db): MangaRepository {
               synopsis: input.synopsis,
               status: input.status,
               readingDirection: input.readingDirection,
-              // A new title is a DRAFT; `setPublished` is the only way in
-              // (FR-ADMIN-001 → FR-CHAPTER-002). The port has no `published`
-              // field, which is the same statement.
+              // A new title is a DRAFT; `setPublished` is the only way in. The
+              // port has no `published` field, which is the same statement.
               published: false,
             })
             .returning({ id: manga.id });
@@ -837,8 +853,8 @@ export function createMangaRepository(db: Db): MangaRepository {
       }>,
     ): Promise<void> {
       // `slug` is deliberately NOT patchable: it is the URL identity and is
-      // immutable after first publish (EC-ADM-07, DATA_MODEL §21.5). The port's
-      // patch type already omits it; this is where that is enforced.
+      // immutable after first publish. The port's patch type already omits it;
+      // this is where that is enforced.
       const scalars: Partial<{
         title: string;
         synopsis: string;
@@ -851,9 +867,9 @@ export function createMangaRepository(db: Db): MangaRepository {
       if (patch.readingDirection !== undefined) scalars.readingDirection = patch.readingDirection;
       await db.transaction(async (tx) => {
         if (Object.keys(scalars).length > 0) {
-          // `updated_at` is bumped explicitly because DATA_MODEL §7 gives the
-          // column a DEFAULT but no trigger, and `updated_desc` is a catalog
-          // sort: an edit must float the title.
+          // `updated_at` is bumped explicitly because the column has a DEFAULT
+          // but no trigger, and `updated_desc` is a catalog sort: an edit must
+          // float the title.
           await tx
             .update(manga)
             .set({ ...scalars, updatedAt: TOUCHED_AT })
@@ -868,9 +884,9 @@ export function createMangaRepository(db: Db): MangaRepository {
     },
 
     async softDelete(id: MangaId): Promise<void> {
-      // Idempotent by construction (NFR-DATA-002): the `deleted_at IS NULL`
-      // guard means a second call updates zero rows, so the stamp can never be
-      // re-taken and `restore` is the only way back.
+      // Idempotent by construction: the `deleted_at IS NULL` guard means a
+      // second call updates zero rows, so the stamp can never be re-taken and
+      // `restore` is the only way back.
       await db
         .update(manga)
         .set({ deletedAt: TOUCHED_AT, updatedAt: TOUCHED_AT })
@@ -889,8 +905,9 @@ export function createMangaRepository(db: Db): MangaRepository {
     },
 
     async count(): Promise<number> {
-      // Counts every row, soft-deleted included; the admin list is where a
-      // filtered view lives.
+      // The stats tile counts the collection as it is, so this counts every
+      // row, soft-deleted included; the admin LIST is where a filtered view
+      // lives. The data model does not say which population the tile means.
       const [row] = await db.select({ total: count() }).from(manga);
       return Number(row?.total ?? 0);
     },

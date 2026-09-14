@@ -1,7 +1,10 @@
 /**
- * Chapter and page reads plus the upload commit path.
- * Order is `reading_order` alone; it is unique per manga so no tiebreaker.
- * A chapter is readable only when both the chapter and its manga are.
+ * The `ChapterRepository` port against PostgreSQL. `reading_order` is the stored
+ * order key, derived from the chapter `number` (×100, injective for
+ * `numeric(8,2)`), so the UNIQUE `(manga_id, reading_order)` index can never be
+ * violated by a fractional chapter. A chapter is readable only when both the
+ * chapter axis and the parent manga axis are readable, and `commitPages` writes
+ * the page set plus `page_count` in one advisory-locked transaction.
  */
 import {
   and,
@@ -25,6 +28,7 @@ import type {
 import { AppError } from '../../../shared/contracts/errors';
 import type { ChapterRepository } from '../../../features/chapters';
 import type { AssetKey, ChapterId, MangaId, MangaSlug } from '../../../shared/types';
+import { mediaUrlFor } from '../../../shared/storage-keys';
 import type { Db } from '../client';
 import { chapter, chapterPage, manga } from '../schema';
 import { chapterVisibleWhere, mangaReadClauses, mayReadDrafts } from './manga.repository';
@@ -34,8 +38,6 @@ type Executor = Pick<Db, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 /** The `sql\`now()\`` stamp, matching the columns' `DEFAULT now()`. */
 const STAMP = sql`now()`;
-
-/* ── row shapes and row → DTO mapping (data-flow.md §7) ──────────────────── */
 
 /** The scalar columns the ChapterSummary/pageList shapes read. */
 const CHAPTER_COLUMNS = {
@@ -66,7 +68,7 @@ interface ChapterRow {
   deletedAt: Date | null;
 }
 
-/** `numeric(8,2)` arrives as a string; the DTOs say `number` (ADR-003 R2). */
+/** `numeric(8,2)` arrives as a string; the DTOs say `number`. */
 function asNumber(value: string | number): number {
   return typeof value === 'number' ? value : Number(value);
 }
@@ -81,39 +83,45 @@ function toSummary(row: ChapterRow): ChapterSummary {
     number: asNumber(row.number),
     title: row.title,
     pageCount: row.pageCount,
-    // Null for a draft (FR-CHAPTER-002); the DTO allows it explicitly.
+    // Null for a draft; the DTO allows it explicitly.
     publishedAt: row.publishedAt === null ? null : asIso(row.publishedAt),
   };
 }
 
-/** One delivery URL per variant, app-relative, never a storage URL. */
-function pageUrl(assetKey: string): string {
-  return `/media/${assetKey}`;
-}
-
+/**
+ * One delivery URL per variant, built by the single rule in
+ * `shared/storage-keys.ts` (`mediaUrlFor`) — app-relative, never a storage URL.
+ *
+ * The three URLs are DISTINCT, one per variant: there is no runtime negotiation
+ * server-side (`<picture>` picks the variant), and the delivery layer parses the
+ * variant back out of the URL, so an extensionless URL is a 404 by grammar.
+ */
 function toPageAsset(row: {
   pageNumber: number;
   assetKey: string;
   width: number;
   height: number;
 }): PageAsset {
-  const url = pageUrl(row.assetKey);
   return {
     pageNumber: row.pageNumber,
-    urlAvif: url,
-    urlWebp: url,
-    urlJpeg: url,
+    urlAvif: mediaUrlFor(row.assetKey, 'avif'),
+    urlWebp: mediaUrlFor(row.assetKey, 'webp'),
+    urlJpeg: mediaUrlFor(row.assetKey, 'jpeg'),
     width: row.width,
     height: row.height,
   };
 }
 
-/** Deterministic page id from the composite key; no surrogate column. */
+/**
+ * `ChapterPageRecord.id`.
+ *
+ * The composite `(chapter_id, page_number)` IS the primary key, and the DTO's
+ * `id` is that real key rendered deterministically — nothing is invented, and no
+ * surrogate column is needed.
+ */
 function pageRecordId(chapterId: string, pageNumber: number): string {
   return `${chapterId}:${pageNumber}`;
 }
-
-/* ── driver-error classification ─────────────────────────────────────────── */
 
 /**
  * A postgres.js unique violation carries `23505` and often the index name.
@@ -146,14 +154,11 @@ function isForeignKeyViolation(error: unknown): boolean {
   return false;
 }
 
-/* ── query builders (one definition each; the factory and the gate share them) */
-
 /**
  * The chapter list for one manga, ordered by `reading_order`.
  *
  * Index: `ix_chapters_manga_order` — the UNIQUE `(manga_id, reading_order)`
- * index. With `manga_id` pinned, the index scan IS the required order
- * (FR-CHAPTER-004, NFR-PERF-014).
+ * index. With `manga_id` pinned, the index scan IS the required order.
  *
  * The caller decides draft visibility; the manga axis is checked by the caller
  * too (see {@link buildChapterListQuery}'s wrapper `listByManga`), because the
@@ -170,8 +175,10 @@ export function buildChapterListQuery(db: Db, mangaId: MangaId, caller: CallerCo
 /**
  * The page range scan for one chapter, ascending by `page_number`.
  *
- * Served by the `chapter_page` primary key, so this reads N rows through that
- * index — never a table scan, and never one query per page.
+ * Index: the `chapter_page` PRIMARY KEY `(chapter_id, page_number)`, so this
+ * reads N rows through that index — never a table scan, and never one query per
+ * page. The scan shape (ordered range scan vs bitmap + sort) is PostgreSQL's
+ * cost decision; the index is not.
  */
 export function buildChapterPagesQuery(db: Db, chapterId: ChapterId) {
   return db
@@ -214,7 +221,7 @@ function neighbourQuery(
     .limit(1);
 }
 
-/** Whether this manga is readable by this caller (the manga axis, FR-CHAPTER-002). */
+/** Whether this manga is readable by this caller (the manga axis). */
 async function mangaReadable(
   db: Db,
   mangaId: MangaId,
@@ -228,7 +235,7 @@ async function mangaReadable(
   return rows.length > 0;
 }
 
-/** Whether this chapter is readable by this caller (both axes, FR-CHAPTER-002). */
+/** Whether this chapter is readable by this caller (both axes). */
 async function chapterReadable(
   db: Db,
   chapterId: ChapterId,
@@ -277,24 +284,22 @@ async function mangaShape(
   return {
     slug: (row?.slug ?? '') as MangaSlug,
     title: row?.title ?? '',
-    // Anything other than the CHECK's two values cannot be stored
-    // (DATA_MODEL §3), so this is a narrowing, not a guess.
+    // Anything other than the CHECK's two values cannot be stored, so this is a
+    // narrowing, not a guess.
     readingDirection: row?.readingDirection === 'ltr' ? 'ltr' : 'rtl',
   };
 }
-
-/* ── the repository ──────────────────────────────────────────────────────── */
 
 /**
  * Builds the Drizzle `ChapterRepository`.
  *
  * @param db the application's handle from `createDb(env)` — the only place a
- *   connection is ever needed (ADR-003, dependency rule D2).
+ *   connection is ever needed (dependency rule D2).
  */
 export function createChapterRepository(db: Db): ChapterRepository {
   /**
-   * Asserts a page set is exactly `1..N` — DATA_MODEL §21.2's contiguity
-   * invariant, which the commit path is the only writer of.
+   * Asserts a page set is exactly `1..N` — the commit path's contiguity
+   * invariant.
    *
    * Checked BEFORE any statement, so a bad set writes nothing and costs no round
    * trip. The `page_number >= 1` CHECK in the schema catches a single bad
@@ -322,7 +327,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
     async listByManga(mangaId: MangaId, caller: CallerContext): Promise<ChapterSummary[]> {
       // The manga axis first (one PK seek on `manga`), so a hidden title's
       // chapter list is `[]` rather than an index scan of chapters nobody may
-      // read (FR-CHAPTER-002, FR-ADMIN-003).
+      // read.
       if (!(await mangaReadable(db, mangaId, caller))) return [];
       const rows = (await buildChapterListQuery(db, mangaId, caller)) as ChapterRow[];
       return rows.map(toSummary);
@@ -360,8 +365,8 @@ export function createChapterRepository(db: Db): ChapterRepository {
           pageCount: row.pageCount,
         },
         pages: pages.map(toPageAsset),
-        // FR-READER-016: neighbours are published-only for a non-admin, which
-        // `neighbourQuery` already applied through `chapterVisibleWhere`.
+        // Neighbours are published-only for a non-admin, which `neighbourQuery`
+        // already applied through `chapterVisibleWhere`.
         prevChapter: neighbour(prev[0] as ChapterRow | undefined),
         nextChapter: neighbour(next[0] as ChapterRow | undefined),
       };
@@ -392,10 +397,10 @@ export function createChapterRepository(db: Db): ChapterRepository {
     }): Promise<ChapterId> {
       try {
         return await db.transaction(async (tx) => {
-          // The parent must exist and must not be soft-deleted (FR-ADMIN-003).
+          // The parent must exist and must not be soft-deleted.
           // The port's `create` carries no caller, so the DRAFT axis is not
           // checked: an admin creates chapters on a draft title every day, and
-          // the publish path is the thing that enforces FR-CHAPTER-002.
+          // the publish path is the thing that enforces readability.
           const parent = await tx
             .select({ id: manga.id })
             .from(manga)
@@ -406,18 +411,35 @@ export function createChapterRepository(db: Db): ChapterRepository {
             .insert(chapter)
             .values({
               mangaId: input.mangaId,
-              // numeric(8,2): bound as a string so 10.5 stays exact (ADR-003 R2).
+              // numeric(8,2): bound as a string so 10.5 stays exact.
               number: input.number.toFixed(2),
               title: input.title,
               notes: input.notes,
-              // A new chapter is a DRAFT; `setPublished` is the only way in
-              // (FR-CHAPTER-002).
+              // A new chapter is a DRAFT; `setPublished` is the only way in.
               status: 'draft',
-              // `reading_order` is the stored order key, derived from the chapter
-              // number (×100, the smallest injective scale for two decimals),
-              // so order-by-number and order-by-reading_order agree and the
-              // unique index cannot collide on fractional chapters like 10.5.
-              // The DTOs expose `number`, never `reading_order`.
+              // `reading_order` is the stored order key (the leading half of the
+              // UNIQUE `ix_chapters_manga_order`), and the port's `create`
+              // carries no order field, so the repository derives it from the
+              // chapter NUMBER: order is "by number", and the integer column is
+              // the indexable form of that.
+              //
+              // ×100 is the smallest injective factor for `numeric(8,2)`: two
+              // distinct numbers always scale to distinct integers, so the
+              // UNIQUE index can never be violated by a fractional chapter
+              // (1.00 → 100, 10.50 → 1050, 11.00 → 1100). `floor()` would
+              // collide chapter 10 with the special chapter 10.5. The scale is
+              // invisible to readers — the DTOs expose `number`, never
+              // `reading_order` — and the seed harness uses the same
+              // "reading_order tracks the number" convention.
+              //
+              // Insertion order (`max+1`) would render 5 before 3 when chapter 3
+              // is added second, while `number` — the value the reader sees —
+              // says otherwise. It also costs a `MAX(reading_order)` read per
+              // insert, racy under concurrent admin writes, to derive what the
+              // row already determines. Note the ×100 factor is only injective
+              // BECAUSE `number` is `numeric(8,2)`: if chapter numbers ever need
+              // more decimals, revisit this before the schema changes, or the
+              // UNIQUE index starts throwing on legal input.
               readingOrder: sql`(${input.number.toFixed(2)}::numeric * 100)::int`,
             })
             .returning({ id: chapter.id });
@@ -447,7 +469,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
       if (patch.number !== undefined) values.number = patch.number.toFixed(2);
       if (patch.title !== undefined) values.title = patch.title;
       if (patch.notes !== undefined) values.notes = patch.notes;
-      // ONE statement, so a refused patch (a duplicate `number`, FR-CHAPTER-001)
+      // ONE statement, so a refused patch (a duplicate `number`)
       // cannot half-apply: the whole UPDATE is rolled back by PostgreSQL.
       try {
         await db.update(chapter).set(values).where(eq(chapter.id, id));
@@ -460,7 +482,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
     },
 
     async softDelete(id: ChapterId): Promise<void> {
-      // Idempotent by construction (NFR-DATA-002), and never touches a row that
+      // Idempotent by construction, and never touches a row that
       // is already soft-deleted, so the stamp cannot be re-taken.
       await db
         .update(chapter)
@@ -470,7 +492,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
 
     async setPublished(id: ChapterId, published: boolean): Promise<void> {
       // `published_at` is the publish stamp and is cleared on unpublish, so a
-      // draft's `publishedAt` is null in the DTO (FR-CHAPTER-002).
+      // draft's `publishedAt` is null in the DTO.
       await db
         .update(chapter)
         .set({
@@ -495,7 +517,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
       replace: boolean;
     }): Promise<{ replacedAssetKeys: string[] }> {
       // Before the transaction: a page set that is not exactly 1..N is refused
-      // with no write and no round trip (DATA_MODEL §21.2, T-UPLOAD-007).
+      // with no write and no round trip.
       assertContiguous(input.pages.map((page) => page.pageNumber));
 
       return db.transaction(async (tx) => {
@@ -526,7 +548,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
 
         const replacedAssetKeys: string[] = [];
         if (input.replace) {
-          // Re-ingest (FR-UPLOAD-009): collect the OLD keys first so the caller
+          // Re-ingest: collect the OLD keys first so the caller
           // can queue them for GC, then replace the set atomically.
           const old = await tx
             .select({ assetKey: chapterPage.assetKey })
@@ -537,7 +559,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
         }
         await createPageRecords(tx, input.chapterId, input.pages);
         // The denormalized counter is written WITH the rows it counts, in the
-        // same transaction (NFR-PERF-014).
+        // same transaction.
         await tx
           .update(chapter)
           .set({ pageCount: input.pages.length, updatedAt: STAMP })
@@ -548,7 +570,7 @@ export function createChapterRepository(db: Db): ChapterRepository {
 
     async countByManga(mangaId: MangaId): Promise<number> {
       // The port takes no caller, so this is the READER's count: published,
-      // undeleted chapters (FR-CHAPTER-002).
+      // undeleted chapters.
       const [row] = await db
         .select({ total: count() })
         .from(chapter)

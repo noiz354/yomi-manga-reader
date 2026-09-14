@@ -1,7 +1,10 @@
 /**
- * Library and bookmark ports. The list page is one statement with lateral
- * joins and a correlated badge subquery, never per-row queries.
- * Ownership is structural: every statement scopes on the caller id.
+ * The `LibraryRepository` and `BookmarkRepository` ports against PostgreSQL.
+ * `list()` is ONE statement (two LATERAL joins plus a correlated unread-count
+ * subquery), so a page never fans out into N+1. `lastRead` is derived from
+ * `reading_progress`, never the unwritten `library_entry.last_read_at`, and
+ * ownership is structural: `userId` is a bind parameter of every statement.
+ * Idempotence is the primary key's job, not a caller-side pre-check.
  */
 import { and, count, desc, eq, sql, type SQL } from 'drizzle-orm';
 import type {
@@ -17,11 +20,10 @@ import type {
   MangaSummary,
 } from '../../../shared/contracts';
 import type { BookmarkId, ChapterId, MangaId, MangaSlug, UserId } from '../../../shared/types';
+import { mediaUrlFor } from '../../../shared/storage-keys';
 import type { Db } from '../client';
 import { bookmark, chapter, libraryEntry, manga, readingProgress } from '../schema';
 import { chapterVisibleWhere } from './manga.repository';
-
-/* ── limits (API_CONTRACT §2.4) ────────────────────────────────────────────── */
 
 /** The page size when the caller names none. */
 export const LIBRARY_DEFAULT_LIMIT = 24;
@@ -29,16 +31,14 @@ export const LIBRARY_DEFAULT_LIMIT = 24;
 /** The hard page cap: `GET /api/v1/library` allows `limit ≤ 48`. */
 export const LIBRARY_MAX_LIMIT = 48;
 
-/* ── cursors (manga.repository.ts's format, with the null-key case added) ──── */
-
 /**
  * Every sort a cursor can be minted for, on either repository.
  *
- * The bookmark list has exactly one order (newest first, API_CONTRACT §2.4), and
- * naming it here rather than hard-coding it inside the query gives the `s` guard
- * something to reject against: a library cursor handed to `BookmarkRepository`
- * (or the reverse) is a different `s` and is refused instead of compared against
- * a column it was never minted for.
+ * The bookmark list has exactly one order (newest first), and naming it here
+ * rather than hard-coding it inside the query gives the `s` guard something to
+ * reject against: a library cursor handed to `BookmarkRepository` (or the
+ * reverse) is a different `s` and is refused instead of compared against a
+ * column it was never minted for.
  */
 type CursorSort = LibrarySort | 'newest_desc';
 
@@ -60,17 +60,16 @@ interface PageCursor {
   readonly i: string;
 }
 
-/** The one order `BookmarkRepository.list` uses (API_CONTRACT §2.4 "newest first"). */
+/** The one order `BookmarkRepository.list` uses (newest first). */
 const BOOKMARK_SORT: CursorSort = 'newest_desc';
 
 /**
  * Encodes a cursor: base64url, so it survives a query string unescaped.
  *
- * Opaque to callers (API_CONTRACT §2.1 types a cursor as an opaque string) and
- * NOT a security token — it carries no authority, so a forged cursor cannot
- * widen a WHERE. {@link decodeCursor} validates the shape before any value is
- * bound, which is what makes a hostile cursor data rather than SQL
- * (NFR-SEC-015).
+ * Opaque to callers and NOT a security token — it carries no authority, so a
+ * forged cursor cannot widen a WHERE. {@link decodeCursor} validates the shape
+ * before any value is bound, which is what makes a hostile cursor data rather
+ * than SQL.
  */
 function encodeCursor(sort: CursorSort, key: string | null, id: string): string {
   const payload: PageCursor = { v: 1, s: sort, k: key, i: id };
@@ -82,9 +81,8 @@ function encodeCursor(sort: CursorSort, key: string | null, id: string): string 
  *
  * Rejects rather than repairs anything unrecognised: a wrong version, a sort it
  * was not minted for, a non-string key, an empty field, or a `null` key for a
- * sort whose key column is NOT NULL (SQ-LIB-4). Repairing any of those would
- * answer a question the caller did not ask — a silently wrong page is worse than
- * a 422 (a silently wrong page is the "cursor stability" edge case).
+ * sort whose key column is NOT NULL. Repairing any of those would answer a
+ * question the caller did not ask — a silently wrong page is worse than a 422.
  */
 function decodeCursor(cursor: string, sort: CursorSort, nullableKey: boolean): PageCursor {
   const invalid = (): never => {
@@ -135,13 +133,11 @@ function requiredCursorArgs(cursor: string, sort: CursorSort): [string, string] 
   return [key, id];
 }
 
-/** Clamps `limit` into `[1, 48]`; bookmarks share the same cap. */
+/** Clamps `limit` into `[1, 48]`. */
 function resolveLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return LIBRARY_DEFAULT_LIMIT;
   return Math.min(Math.max(Math.trunc(limit), 1), LIBRARY_MAX_LIMIT);
 }
-
-/* ── driver-error classification ──────────────────────────────────────────── */
 
 /**
  * A postgres.js unique violation carries `23505` and, when the driver reports it,
@@ -165,14 +161,12 @@ function isUniqueViolation(error: unknown, constraint: string): boolean {
   return false;
 }
 
-/* ── row shapes and row → DTO mapping (data-flow.md §7) ───────────────────── */
-
 /** Drizzle row types stop here; only DTOs leave this module (client.ts, D1/D2). */
 
 /** One row of the library page statement, after the two LATERAL joins. */
 interface LibraryRow {
   addedAt: Date;
-  /** `library_entry.last_read_at` — the SORT key only (see the header, SQ-LIB-1). */
+  /** `library_entry.last_read_at` — the SORT key only. */
   sortLastReadAt: Date | null;
   id: string;
   slug: string;
@@ -207,16 +201,21 @@ interface BookmarkRow {
   mangaTitle: string | null;
 }
 
-/** Shelf card cover URL, null passthrough. */
+/**
+ * The shelf card cover URL: a call into the single rule in
+ * `shared/storage-keys.ts` (`mediaUrlFor`). JPEG variant, `null` passthrough.
+ */
 function coverUrlOf(coverAssetKey: string | null): string | null {
-  return coverAssetKey === null ? null : `/media/${coverAssetKey}`;
+  return coverAssetKey === null ? null : mediaUrlFor(coverAssetKey, 'jpeg');
 }
 
 /**
- * String numerics arrive as strings and every DTO here says number, so the
- * conversion happens once, deliberately, at this boundary. The finite guard
- * keeps a corrupted row degrading to a sortable 0 instead of NaN reaching
- * the shelf UI.
+ * `numeric(8,2)` arrives as a STRING; every DTO here says `number`
+ * (`columns.ts` `exactNumeric`). Converted once, deliberately, at this boundary.
+ *
+ * The `Number.isFinite` guard is deliberate: a non-numeric chapter number would
+ * otherwise become `NaN`, which survives serialization into the shelf UI and
+ * into any comparison the client makes.
  */
 function toNumber(value: string | number): number {
   const parsed = typeof value === 'number' ? value : Number.parseFloat(value);
@@ -227,7 +226,7 @@ function asMangaStatus(value: string): MangaStatus {
   return value === 'completed' || value === 'hiatus' ? value : 'ongoing';
 }
 
-/** timestamptz → ISO-8601 UTC (NFR-DATA-006). */
+/** timestamptz → ISO-8601 UTC. */
 function asIso(value: Date): string {
   return value.toISOString();
 }
@@ -236,8 +235,8 @@ function asIso(value: Date): string {
  * `MangaSummary.latestChapter` for one library row.
  *
  * `null` is the ABSENCE of a LATERAL row — a manga with no published, undeleted
- * chapter — which is exactly the same case `manga.repository.ts`'s zero-chapter
- * path returns, so the two agree by construction (FR-CATALOG-005).
+ * chapter — the same case `manga.repository.ts`'s zero-chapter path returns, so
+ * the two agree by construction.
  *
  * `publishedAt` is non-null in the DTO. A published chapter always carries the
  * stamp (`setPublished` writes it), so the `createdAt` fallback is defensive
@@ -254,8 +253,7 @@ function latestChapterOf(row: LibraryRow): MangaSummary['latestChapter'] {
 }
 
 /**
- * `LibraryEntry.lastRead`, derived from `reading_progress` (see the header and
- * SQ-LIB-1).
+ * `LibraryEntry.lastRead`, derived from `reading_progress`.
  *
  * `null` is the absence of a progress row for this user and this manga, which is
  * a real state: a title added and never opened. `pageNumber` is NOT NULL on a
@@ -272,13 +270,13 @@ function lastReadOf(row: LibraryRow): LibraryEntry['lastRead'] {
 }
 
 /**
- * The `unavailable` flag (EC-ADM-02): the title went unpublished or was
- * soft-deleted, but the ENTRY is still returned.
+ * The `unavailable` flag: the title went unpublished or was soft-deleted, but
+ * the ENTRY is still returned.
  *
  * The library is private, so hiding a title the reader added would silently
  * destroy their shelf; reading it 404s instead. A HARD-deleted manga cascades
  * the `library_entry` row away and therefore never reaches this function — the
- * inner join is the "deleted manga excluded" leg of T-LIB-002.
+ * inner join is the "deleted manga excluded" leg.
  */
 function isUnavailable(row: LibraryRow): boolean {
   return !row.published || row.deletedAt !== null;
@@ -304,17 +302,16 @@ function toLibraryEntry(row: LibraryRow): LibraryEntry {
 /**
  * `Bookmark.chapter`, or `null` when the chapter row is gone.
  *
- * `bookmark.chapter_id` is `ON DELETE SET NULL` (DATA_MODEL §14), so a purged
- * chapter leaves the bookmark RETAINED and jump-disabled (EC-RDR-08,
- * NFR-DATA-005). The manga columns arrive null on the same path and are treated
- * as the same state rather than as a partial chapter.
+ * `bookmark.chapter_id` is `ON DELETE SET NULL`, so a purged chapter leaves the
+ * bookmark RETAINED and jump-disabled. The manga columns arrive null on the
+ * same path and are treated as the same state rather than as a partial chapter.
  */
 function bookmarkChapterOf(row: BookmarkRow): Bookmark['chapter'] {
   if (row.chapterId === null) return null;
   if (row.chapterNumber === null || row.mangaSlug === null || row.mangaTitle === null) return null;
   return {
     id: row.chapterId,
-    // `numeric(8,2)` read back as a number, never as a string (ADR-003 R2).
+    // `numeric(8,2)` read back as a number, never as a string.
     number: toNumber(row.chapterNumber),
     mangaSlug: row.mangaSlug,
     mangaTitle: row.mangaTitle,
@@ -327,13 +324,11 @@ function toBookmark(row: BookmarkRow): Bookmark {
     chapter: bookmarkChapterOf(row),
     pageNumber: row.pageNumber,
     // Plain text, never markup: the CHECK `bookmark_note_len` caps it at 280
-    // (NFR-SEC-016) and this module never renders it (THREAT T-01).
+    // and this module never renders it.
     note: row.note,
     createdAt: asIso(row.createdAt),
   };
 }
-
-/* ── the library sorts, each with its ORDER BY, keyset predicate and index ── */
 
 /** One sort's whole definition, so none of the three can change in isolation. */
 interface LibrarySortSpec {
@@ -352,7 +347,7 @@ interface LibrarySortSpec {
  * it calls), but a repository that indexed `LIBRARY_SORTS[query.sort]` on that
  * promise would throw a bare `TypeError` — 500 — for a caller that skipped the
  * service. The optional field plus {@link resolveLibrarySort} makes the default
- * total (API_CONTRACT §2.4 "last_read_desc default").
+ * total.
  */
 interface LibraryQuery {
   cursor?: string;
@@ -361,10 +356,19 @@ interface LibraryQuery {
 }
 
 /**
- * The three library sorts. `last_read_desc` sorts `NULLS LAST` explicitly
- * because Postgres defaults `DESC` to `NULLS FIRST`, which would put every
- * never-opened title at the top. Its keyset predicate has two branches
- * because a row comparison against a NULL component matches nothing.
+ * The three library sorts.
+ *
+ * `last_read_desc` is the only one with a decision to make: `NULLS LAST` is
+ * written out because Postgres defaults `DESC` to `NULLS FIRST`, and the keyset
+ * predicate has TWO branches because a row comparison against a NULL component
+ * is UNKNOWN rather than false. The other
+ * two sort on NOT NULL columns, so their predicates are the catalog's single row
+ * comparison unchanged.
+ *
+ * `manga_id` is the tiebreaker in all three, exactly as the catalog does, because
+ * none of the three keys is unique; the direction follows the primary sort
+ * (descending for the two time sorts, ascending for the title sort) so the
+ * traversal is one consistent order.
  */
 const LIBRARY_SORTS: Record<LibrarySort, LibrarySortSpec> = {
   last_read_desc: {
@@ -393,7 +397,7 @@ const LIBRARY_SORTS: Record<LibrarySort, LibrarySortSpec> = {
     keyOf: (row) => row.sortLastReadAt?.toISOString() ?? null,
   },
   added_desc: {
-    // No `(user_id, added_at)` index exists — SQ-LIB-2, recorded not hidden.
+    // No `(user_id, added_at)` index exists.
     index: 'library_entry PK (user_id, manga_id) prefix + sort',
     nullableKey: false,
     orderBy: [desc(libraryEntry.addedAt), desc(libraryEntry.mangaId)],
@@ -403,7 +407,7 @@ const LIBRARY_SORTS: Record<LibrarySort, LibrarySortSpec> = {
   },
   title_asc: {
     // `ix_manga_title` is on `manga(title)` and cannot drive a shelf scoped to
-    // one user; see SQ-LIB-2.
+    // one user.
     index: 'library_entry PK (user_id, manga_id) prefix + sort',
     nullableKey: false,
     orderBy: [sql`${manga.title} asc`, sql`${libraryEntry.mangaId} asc`],
@@ -413,7 +417,7 @@ const LIBRARY_SORTS: Record<LibrarySort, LibrarySortSpec> = {
   },
 };
 
-/** The default sort: "last read first" (API_CONTRACT §2.4). */
+/** The default sort: "last read first". */
 const DEFAULT_LIBRARY_SORT: LibrarySort = 'last_read_desc';
 
 /**
@@ -431,15 +435,15 @@ function resolveLibrarySort(sort: LibrarySort | undefined): LibrarySort {
  *
  * Every interpolated fragment is a COLUMN reference or the output of
  * {@link chapterVisibleWhere}, so the statement is fully parameterised and no
- * runtime value is ever concatenated into SQL text (NFR-SEC-015).
+ * runtime value is ever concatenated into SQL text.
  *
  * Why a scalar subquery and not a join: a join over `chapter` would multiply one
  * library row by its chapter count, which breaks both the LIMIT semantics of
  * keyset pagination and the 1:1 row ↔ `LibraryEntry` mapping. Why `not exists`
  * rather than a second count: completion is per (user, chapter), so "published
  * chapters minus completed ones" is a per-row predicate, not a subtraction of
- * two aggregates — and a subtraction could go negative if a completion referred to
- * a chapter that has since been deleted, which the FR would then render as a
+ * two aggregates — and a subtraction could go negative if a completion referred
+ * to a chapter that has since been deleted, which would then render as a
  * negative badge.
  */
 function unreadChapterCountSql(): SQL<number> {
@@ -461,14 +465,13 @@ function unreadChapterCountSql(): SQL<number> {
 /**
  * The caller's most recent position in this manga, as a one-row LATERAL.
  *
- * Ordered by `reading_progress.updated_at` because that is the SERVER stamp
- * NFR-DATA-003 gives the LWW rule, so "most recent" cannot be a client value;
- * `chapter_id` is the tiebreaker because two rows can share a stamp.
+ * Ordered by `reading_progress.updated_at` because that is the SERVER stamp, so
+ * "most recent" cannot be a client value; `chapter_id` is the tiebreaker because
+ * two rows can share a stamp.
  *
  * `readingProgress` is joined to `chapter` because the DTO names a chapter
  * NUMBER, not an id, and `chapter.manga_id` is what correlates the subquery to
- * this library row. The chapter-side visibility rule is deliberately absent — see
- * SQ-LIB-6.
+ * this library row. The chapter-side visibility rule is deliberately absent.
  */
 function lastReadLateral(db: Db, userId: UserId) {
   return db
@@ -481,8 +484,8 @@ function lastReadLateral(db: Db, userId: UserId) {
     .innerJoin(chapter, eq(chapter.id, readingProgress.chapterId))
     .where(
       and(
-        // The caller's own rows only. `userId` came from the session caller
-        // (THREAT T-04); there is no other user in this statement.
+        // The caller's own rows only. `userId` came from the session caller;
+        // there is no other user in this statement.
         eq(readingProgress.userId, userId),
         eq(chapter.mangaId, libraryEntry.mangaId),
       ),
@@ -515,24 +518,21 @@ function latestChapterLateral(db: Db) {
     .limit(1);
 }
 
-/* ── the library repository ───────────────────────────────────────────────── */
-
 /**
- * Builds the Drizzle `LibraryRepository` (add/remove/has, list, countAll).
+ * Builds the Drizzle `LibraryRepository`.
  *
  * @param db the application's handle from `createDb(env)` — the only place a
- *   connection is ever needed (ADR-003, dependency rule D2).
+ *   connection is ever needed (dependency rule D2).
  */
 export function createLibraryRepository(db: Db): LibraryRepository {
   /**
    * The ONE page statement: a PK-keyset-scoped slice of the caller's shelf with
    * every derived field already in the projection.
    *
-   * The inner join on `manga` is the "deleted manga excluded" leg of T-LIB-002
-   * (a hard delete cascades `library_entry` away, and an inner join makes a
-   * missing title a non-row rather than a card of nulls). A soft-deleted or
-   * unpublished title still joins, because the entry is RETAINED and carries
-   * `unavailable: true` (EC-ADM-02).
+   * The inner join on `manga` is the "deleted manga excluded" leg (a hard delete
+   * cascades `library_entry` away, and an inner join makes a missing title a
+   * non-row rather than a card of nulls). A soft-deleted or unpublished title
+   * still joins, because the entry is RETAINED and carries `unavailable: true`.
    *
    * The LIMIT is `limit + 1`: one row of lookahead is how this function learns
    * there is a next page without a second COUNT.
@@ -555,8 +555,7 @@ export function createLibraryRepository(db: Db): LibraryRepository {
     return db
       .select({
         addedAt: libraryEntry.addedAt,
-        // Projected for the cursor key alone — the payload never reads it
-        // (SQ-LIB-1).
+        // Projected for the cursor key alone — the payload never reads it.
         sortLastReadAt: libraryEntry.lastReadAt,
         id: manga.id,
         slug: manga.slug,
@@ -585,8 +584,8 @@ export function createLibraryRepository(db: Db): LibraryRepository {
 
   return {
     async add(userId: UserId, mangaId: MangaId): Promise<void> {
-      // FR-LIBRARY-001: a double-add is a no-op, not a 409. `ON CONFLICT` on the
-      // PK makes that true atomically — see the header.
+      // A double-add is a no-op, not a 409. `ON CONFLICT` on the PK makes that
+      // true atomically.
       await db
         .insert(libraryEntry)
         .values({ userId, mangaId })
@@ -594,9 +593,9 @@ export function createLibraryRepository(db: Db): LibraryRepository {
     },
 
     async remove(userId: UserId, mangaId: MangaId): Promise<void> {
-      // FR-LIBRARY-002: no-op when absent (the route answers 204 either way,
-      // documented choice in API_CONTRACT §2.4). The owner is in the WHERE, so
-      // one reader's shelf can never be edited through another's id (THREAT T-04).
+      // A no-op when absent (the route answers 204 either way). The owner is in
+      // the WHERE, so one reader's shelf can never be edited through another's
+      // id.
       await db
         .delete(libraryEntry)
         .where(and(eq(libraryEntry.userId, userId), eq(libraryEntry.mangaId, mangaId)));
@@ -634,17 +633,13 @@ export function createLibraryRepository(db: Db): LibraryRepository {
     },
 
     async countAll(): Promise<number> {
-      // FR-ADMIN-008's `libraryEntries` tile is a stat over the table as it is,
-      // so it counts every row; the admin LIST is where a filtered view lives.
-      // Same spec-question as `MangaRepository.count()`: DATA_MODEL does not say
-      // which population the tile means.
+      // A stat over the table as it is, so it counts every row; the admin LIST
+      // is where a filtered view lives.
       const [row] = await db.select({ total: count() }).from(libraryEntry);
       return Number(row?.total ?? 0);
     },
   };
 }
-
-/* ── the bookmark repository ──────────────────────────────────────────────── */
 
 /** The columns a bookmark-shaped read projects, with the two resolution joins. */
 const BOOKMARK_COLUMNS = {
@@ -670,16 +665,14 @@ function bookmarkAfter(key: string, id: string): SQL {
  */
 export function createBookmarkRepository(db: Db): BookmarkRepository {
   /**
-   * The bookmark page statement (API_CONTRACT §2.4 "newest first, chapter
-   * resolved").
+   * The bookmark page statement: newest first, chapter resolved.
    *
-   * BOTH joins are LEFT: `bookmark.chapter_id` is `ON DELETE SET NULL`
-   * (DATA_MODEL §14) and the chapter's own manga row is soft-deleted rather than
-   * removed, so an inner join would silently DROP retained bookmarks instead of
-   * rendering them `chapter: null` (EC-RDR-08, NFR-DATA-005). The visibility rule
-   * is deliberately NOT applied: a bookmark on a title the reader can no longer
-   * open is still theirs, and the DTO's `chapter: null` is how the UI disables
-   * the jump.
+   * BOTH joins are LEFT: `bookmark.chapter_id` is `ON DELETE SET NULL` and the
+   * chapter's own manga row is soft-deleted rather than removed, so an inner
+   * join would silently DROP retained bookmarks instead of rendering them
+   * `chapter: null`. The visibility rule is deliberately NOT applied: a bookmark
+   * on a title the reader can no longer open is still theirs, and the DTO's
+   * `chapter: null` is how the UI disables the jump.
    */
   function bookmarkListSelect(userId: UserId, query: { cursor?: string; limit?: number }) {
     const clauses = [
@@ -720,10 +713,10 @@ export function createBookmarkRepository(db: Db): BookmarkRepository {
               chapterId: input.chapterId,
               // `null` = "chapter start", a valid, repeatable mark: NULLs stay
               // distinct in `ix_bookmarks_user_chapter_page`, so only a NAMED
-              // page can collide (DATA_MODEL §14, INT-LIB-001).
+              // page can collide.
               pageNumber: input.pageNumber,
               // The CHECK `bookmark_note_len` enforces ≤ 280 at the database;
-              // this module never renders or escapes it (NFR-SEC-016).
+              // this module never renders or escapes it.
               note: input.note,
             })
             .returning({ id: bookmark.id });
@@ -744,8 +737,8 @@ export function createBookmarkRepository(db: Db): BookmarkRepository {
         });
       } catch (error) {
         // `ix_bookmarks_user_chapter_page` is the duplicate detector, and the
-        // translation is the port's documented 409 (FR-LIBRARY-009,
-        // API_CONTRACT §2.4). The driver error stays as `cause` (NFR-OBS-006).
+        // translation is the port's documented 409. The driver error stays as
+        // `cause`.
         if (isUniqueViolation(error, 'ix_bookmarks_user_chapter_page')) {
           throw new AppError('LIBRARY_BOOKMARK_EXISTS');
         }
@@ -773,10 +766,10 @@ export function createBookmarkRepository(db: Db): BookmarkRepository {
 
     async delete(userId: UserId, id: BookmarkId): Promise<boolean> {
       // The owner is part of the WHERE, so another user's bookmark can NEVER be
-      // deleted through this method (THREAT T-04): "not yours" and "not there"
-      // are the same zero-row result, which is exactly the `false ⇒ 404` the port
-      // documents. `RETURNING` is what makes the answer a boolean — an
-      // unfiltered delete cannot report ownership after the fact.
+      // deleted through this method: "not yours" and "not there" are the same
+      // zero-row result, which is exactly the `false ⇒ 404` the port documents.
+      // `RETURNING` is what makes the answer a boolean — an unfiltered delete
+      // cannot report ownership after the fact.
       const rows = await db
         .delete(bookmark)
         .where(and(eq(bookmark.id, id), eq(bookmark.userId, userId)))

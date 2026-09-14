@@ -1,33 +1,13 @@
 /**
- * `GET /api/v1/chapters/{chapterId}/pages` (INT-RDR-PAGES, F-006-S2).
+ * `GET /api/v1/chapters/{chapterId}/pages`, driven through the real route.
  *
- * Why this file had to be written
- * -------------------------------
- * The route existed with NO test at all, and this slice rewrote it — moving it
- * off a direct database handle onto `ChapterRepository.pageList`. Rewriting an
- * untested route is how a reader silently loses their pages, so the contract
- * itself is pinned here rather than inferred from the diff.
+ * Two invariants are pinned here. The reader must get every field the client
+ * reads (`chapter`, `readingDirection`, `pageCount`, `mangaSlug`, `urlJpeg`,
+ * `urlAvif`) — `mangaId` is intentionally absent because the client never reads
+ * it. And drafts must stay invisible: a missing chapter and an unpublished one
+ * answer the same 404, so a distinct status can never confirm a draft exists.
  *
- * Two things are being defended:
- *
- * 1. **The reader still gets pages.** The client reads `chapter`,
- *    `readingDirection`, `pageCount`, `mangaSlug`, `urlJpeg` and `urlAvif` — and
- *    `mangaId`, which the OLD hand-built response carried and the CONTRACT does
- *    not. The client does not use `mangaId`, so dropping it is safe; that is
- *    asserted rather than assumed, because "the client does not read it" is the
- *    kind of claim that rots the moment someone adds a field.
- *
- * 2. **Drafts stay invisible.** An anonymous caller must not be able to tell a
- *    missing chapter from an unpublished one, so all three answer 404. The old
- *    route answered **409 `CHAPTER_NOT_READY`** for an unpublished chapter —
- *    a real status change, and a security improvement: 409 confirmed the chapter
- *    exists. It is recorded rather than glossed, because a client branching on 409
- *    would notice.
- *
- * Requirements: FR-READER-012, FR-READER-016, NFR-SEC-015
- * Tasks: T-READER-001
- *
- * DSN: `DATABASE_URL`; SKIPS without it.
+ * Needs DATABASE_URL; skips cleanly without it.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { GET } from '../../src/app/api/v1/chapters/[chapterId]/pages/route';
@@ -51,7 +31,7 @@ const anon = () => new Request('http://yomi.test/api/v1/chapters/x/pages', { hea
 
 const ctx = (chapterId: string) => ({ params: Promise.resolve({ chapterId }) });
 
-describeDb('the chapter pages route (INT-RDR-PAGES, F-006-S2)', () => {
+describeDb('the chapter pages route', () => {
   let open: OpenDatabase;
   let previousDatabaseUrl: string | undefined;
 
@@ -167,7 +147,7 @@ describeDb('the chapter pages route (INT-RDR-PAGES, F-006-S2)', () => {
   });
 
   it('serves an anonymous reader every field the reader client actually reads', async () => {
-    // No session: reading is public by design (PRODUCT.md commitment 2).
+    // No session: reading is public by design.
     const res = await GET(anon(), ctx(CH_1));
     expect(res.status).toBe(200);
     const body = (await res.json()) as ChapterPagesResponse;
@@ -180,23 +160,21 @@ describeDb('the chapter pages route (INT-RDR-PAGES, F-006-S2)', () => {
     expect(body.chapter.pageCount).toBe(2);
     expect(body.chapter.readingDirection).toBe('rtl');
     expect(body.pages).toHaveLength(2);
-    // The three variants share one key: `/media/{key}` serves the stored
-    // format, so all three URLs are the same app-relative path.
-    expect(body.pages[0]?.urlJpeg).toMatch(/^\/media\/[0-9a-f]{32}$/);
-    expect(body.pages[0]?.urlJpeg).toBe(body.pages[0]?.urlAvif);
-    expect(body.pages[0]?.urlJpeg).toBe(body.pages[0]?.urlWebp);
+    // One distinct URL per variant: the extension selects the stored variant and
+    // the delivery grammar requires it, so an extensionless `/media/{key}` is a
+    // 404 by grammar, not a negotiation.
+    expect(body.pages[0]?.urlJpeg).toMatch(/^\/media\/[0-9a-f]{32}\.jpeg$/);
+    expect(body.pages[0]?.urlWebp).toMatch(/^\/media\/[0-9a-f]{32}\.webp$/);
+    expect(body.pages[0]?.urlAvif).toMatch(/^\/media\/[0-9a-f]{32}\.avif$/);
     expect(body.pages[0]?.pageNumber).toBe(1);
 
-    // `mangaId` was in the OLD hand-built response and is NOT in the contract.
-    // Dropping it is safe only because the client never reads it, so that is
-    // asserted as a fact about the contract rather than left to memory.
+    // `mangaId` is NOT in the contract. Dropping it is safe only because the
+    // client never reads it, so that is asserted rather than left to memory.
     expect('mangaId' in body.chapter).toBe(false);
   });
 
   it('hands over the chapter neighbours the reader has never had', async () => {
-    // FR-READER-016 was already implemented in the port and already returned by
-    // `pageList`; the old hand-built route dropped it. This is where F-007-S1 gets
-    // its data from.
+    // The reader needs the neighbours; `pageList` already returns them.
     const first = (await (await GET(anon(), ctx(CH_1))).json()) as ChapterPagesResponse;
     expect(first.prevChapter).toBeNull();
     expect(first.nextChapter?.number).toBe(2);
@@ -208,8 +186,7 @@ describeDb('the chapter pages route (INT-RDR-PAGES, F-006-S2)', () => {
 
   it('answers 404 for a missing chapter and for an unpublished one alike', async () => {
     // The same answer on purpose: a distinct status would confirm to an anonymous
-    // caller that a draft chapter exists. The old route answered 409 for the
-    // unpublished case, which is a real status change and a security improvement.
+    // caller that a draft chapter exists.
     const missing = await GET(anon(), ctx(MISSING));
     const draftManga = await GET(anon(), ctx(CH_DRAFT));
 

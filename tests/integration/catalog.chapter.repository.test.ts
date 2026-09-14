@@ -1,19 +1,11 @@
 /**
- * Integration tests — ChapterRepository against a REAL PostgreSQL 18.
+ * Integration tests — ChapterRepository against a REAL PostgreSQL.
  *
- * Chapter order (decimals like 10.5, tiebreak by reading_order, drafts
- * excluded for non-admin), atomic `commitPages`, the manga visibility rule on
- * chapter reads, and index-backed hot paths (asserted via EXPLAIN).
+ * Pins chapter ordering (numeric with decimals, tiebreak by reading_order,
+ * drafts hidden from non-admins), atomic page commits, and manga visibility
+ * applied to chapter reads.
  *
- * DSN: `DATABASE_URL`. SKIPS when absent:
- *   DATABASE_URL=postgres://yomi:yomi@127.0.0.1:55440/yomi \
- *     npx vitest run tests/integration/catalog.chapter.repository.test.ts
- *
- * SAFETY: `beforeEach` TRUNCATEs every table — point this suite at a THROWAWAY
- * database (see the note in catalog.db-harness.ts about the single fork).
- *
- * No product content: every title, chapter title and note is generated test
- * data (generated test data only).
+ * SAFETY: `beforeEach` TRUNCATEs every table — use a THROWAWAY database.
  */
 import { beforeAll, afterAll, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -37,17 +29,17 @@ const READER: CallerContext = {
   role: 'reader',
 };
 
-describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real PostgreSQL 18', () => {
+describeDb('ChapterRepository on a real PostgreSQL 18', () => {
   let harness: Harness;
   let chapters: ChapterRepository;
   let manga: ReturnType<typeof createMangaRepository>;
   let mangaId: MangaId;
   let counter = 0;
 
-/** One synthetic page record. */
+  /** One synthetic page record (grammar-valid base key). */
   const page = (pageNumber: number) => ({
     pageNumber,
-    assetKey: `seed/v1/page/${counter.toString().padStart(6, '0')}${pageNumber}`,
+    assetKey: `abcd${counter.toString().padStart(6, '0')}${pageNumber}abcdabcdabcdabcdabcdab`,
     width: 480,
     height: 720,
     byteSizeAvif: 1_024,
@@ -71,9 +63,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     mangaId = await createManga(harness, { published: true, slug: 'fixture-manga' });
   });
 
-  /* ── listByManga: order, visibility, zero chapters ─────────────────────── */
-
-  describe('listByManga() (FR-CATALOG-007, FR-CHAPTER-002, FR-CHAPTER-004)', () => {
+  describe('listByManga()', () => {
     it('orders by reading_order, not by insertion, and stays deterministic', async () => {
       // Created out of order on purpose: the port's documented order is
       // `reading_order`, which the repository assigns in creation order.
@@ -86,13 +76,13 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(list.map((c) => c.number)).toEqual([1, 2, 3]);
     });
 
-    it('accepts a decimal number such as 10.5 and reads it back exactly (DATA_MODEL §9)', async () => {
+    it('accepts a decimal number such as 10.5 and reads it back exactly', async () => {
       const special = await chapters.create({ mangaId, number: 10.5, title: 'special', notes: '' });
       const found = (await chapters.listByManga(mangaId, ADMIN)).find((c) => c.id === special);
       expect(found?.number).toBe(10.5);
     });
 
-    it('excludes drafts and soft-deleted chapters for a non-admin (FR-CHAPTER-002)', async () => {
+    it('excludes drafts and soft-deleted chapters for a non-admin', async () => {
       const published = await chapters.create({ mangaId, number: 1, title: 'pub', notes: '' });
       await chapters.setPublished(published, true);
       await chapters.create({ mangaId, number: 2, title: 'draft', notes: '' });
@@ -116,22 +106,22 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect([...list.map((c) => c.id)].sort()).toEqual([published, draft].sort());
     });
 
-    it('is empty for a manga with no chapters at all (T-CATALOG-001 edge case)', async () => {
+    it('is empty for a manga with no chapters at all (edge case)', async () => {
       expect(await chapters.listByManga(mangaId, ADMIN)).toEqual([]);
       expect(await chapters.listByManga(mangaId, null)).toEqual([]);
     });
 
-    it('is empty for a non-visible manga, even for published chapters (FR-CHAPTER-002)', async () => {
+    it('is empty for a non-visible manga, even for published chapters', async () => {
       const draftManga = await createManga(harness, { published: false, slug: 'draft-manga' });
       const chapter = await chapters.create({ mangaId: draftManga, number: 1, title: 'x', notes: '' });
       await chapters.setPublished(chapter, true);
       expect(await chapters.listByManga(draftManga, null)).toEqual([]);
       expect(await chapters.listByManga(draftManga, READER)).toEqual([]);
-      // …and the admin still sees it (FR-ADMIN-001).
+      // …and the admin still sees it.
       expect((await chapters.listByManga(draftManga, ADMIN)).map((c) => c.id)).toEqual([chapter]);
     });
 
-    it('is empty for a soft-deleted manga for EVERYONE (FR-ADMIN-003)', async () => {
+    it('is empty for a soft-deleted manga for EVERYONE', async () => {
       const removed = await createManga(harness, {
         published: true,
         deleted: false,
@@ -147,7 +137,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(await chapters.listByManga(removed, ADMIN)).toEqual([]);
     });
 
-    it('carries the denormalized pageCount and the publish stamp (NFR-PERF-014)', async () => {
+    it('carries the denormalized pageCount and the publish stamp', async () => {
       const id = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       await chapters.commitPages({ chapterId: id, pages: [page(1), page(2), page(3)], replace: false });
       const draft = (await chapters.listByManga(mangaId, ADMIN)).find((c) => c.id === id);
@@ -158,8 +148,6 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(published?.publishedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     });
   });
-
-  /* ── byId ──────────────────────────────────────────────────────────────── */
 
   describe('byId()', () => {
     it('returns a published chapter of a visible manga to an anonymous caller', async () => {
@@ -187,10 +175,8 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── pageList: ordered pages + published neighbours (FR-READER-016) ────── */
-
   describe('pageList()', () => {
-    it('returns pages in ascending pageNumber with app-relative variant URLs (FR-MEDIA-002)', async () => {
+    it('returns pages in ascending pageNumber with app-relative variant URLs', async () => {
       const id = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       await chapters.commitPages({
         chapterId: id,
@@ -201,15 +187,18 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
 
       const response = await chapters.pageList(id, null);
       expect(response?.pages.map((p) => p.pageNumber)).toEqual([1, 2, 3]);
-      expect(response?.pages[0]?.urlAvif).toBe(response?.pages[0]?.urlWebp);
-      expect(response?.pages[0]?.urlAvif).toMatch(/^\/media\/seed\/v1\/page\//);
+      // One distinct delivery URL per variant.
+      const first = response?.pages[0];
+      expect(first?.urlAvif).toMatch(/^\/media\/[A-Za-z0-9_-]{22,64}\.avif$/);
+      expect(first?.urlWebp).toMatch(/^\/media\/[A-Za-z0-9_-]{22,64}\.webp$/);
+      expect(first?.urlJpeg).toMatch(/^\/media\/[A-Za-z0-9_-]{22,64}\.jpeg$/);
       expect(response?.pages[0]?.width).toBe(480);
       expect(response?.chapter.pageCount).toBe(3);
       expect(response?.chapter.readingDirection).toBe('rtl');
       expect(response?.chapter.title).toBe('one');
     });
 
-    it('resolves prev/next by reading_order, published only for a non-admin (FR-READER-016)', async () => {
+    it('resolves prev/next by reading_order, published only for a non-admin', async () => {
       const one = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       const two = await chapters.create({ mangaId, number: 2, title: 'two', notes: '' });
       const three = await chapters.create({ mangaId, number: 3, title: 'three', notes: '' });
@@ -257,10 +246,8 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── pageRecords: the server-side view ─────────────────────────────────── */
-
   describe('pageRecords()', () => {
-    it('returns the raw storage records in ascending page order with the byte record (NFR-PERF-009)', async () => {
+    it('returns the raw storage records in ascending page order with the byte record', async () => {
       const id = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       const records = [page(1), page(2)];
       await chapters.commitPages({ chapterId: id, pages: records, replace: false });
@@ -269,7 +256,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(rows[0]?.chapterId).toBe(id);
       expect(rows[0]?.assetKey).toBe(records[0]?.assetKey);
       expect(rows[0]?.byteSizeAvif).toBe(1_024);
-      // DATA_MODEL §10 has no surrogate `id`; the composite PK is rendered as a
+      // The table has no surrogate `id`; the composite PK is rendered as a
       // string so the DTO stays total (see the implementation header).
       expect(rows[0]?.id).toBe(`${id}:1`);
     });
@@ -280,10 +267,8 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── writes ────────────────────────────────────────────────────────────── */
-
   describe('create / update / softDelete / setPublished', () => {
-    it('derives reading_order from the chapter number, so insertion order is irrelevant (FR-CHAPTER-004)', async () => {
+    it('derives reading_order from the chapter number, so insertion order is irrelevant', async () => {
       // Inserted DESCENDING by number on purpose: the list must still come back
       // in number order, because `reading_order` — not creation time — is the
       // order key.
@@ -312,7 +297,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(list.map((c) => c.number)).toEqual([10, 10.5, 11]);
     });
 
-    it('create() rejects a duplicate (manga, number) with CHAPTER_DUPLICATE_NUMBER (FR-CHAPTER-001)', async () => {
+    it('create() rejects a duplicate (manga, number) with CHAPTER_DUPLICATE_NUMBER', async () => {
       await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       await expect(
         chapters.create({ mangaId, number: 1, title: 'again', notes: '' }),
@@ -352,8 +337,6 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── commitPages: the atomic upload commit (FR-UPLOAD-006) ─────────────── */
-
   describe('commitPages()', () => {
     it('writes the full 1..N set and page_count in ONE transaction', async () => {
       const id = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
@@ -362,7 +345,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect((await chapters.listByManga(mangaId, ADMIN)).find((c) => c.id === id)?.pageCount).toBe(3);
     });
 
-    it('refuses a non-contiguous page set and writes NOTHING (DATA_MODEL §21.2)', async () => {
+    it('refuses a non-contiguous page set and writes NOTHING', async () => {
       const id = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       await expect(
         chapters.commitPages({ chapterId: id, pages: [page(1), page(3)], replace: false }),
@@ -385,7 +368,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       ).rejects.toThrowError(AppError);
     });
 
-    it('replaces the whole set on re-ingest and returns the OLD asset keys (FR-UPLOAD-009)', async () => {
+    it('replaces the whole set on re-ingest and returns the OLD asset keys', async () => {
       const id = await chapters.create({ mangaId, number: 1, title: 'one', notes: '' });
       const first = [page(1), page(2)];
       await chapters.commitPages({ chapterId: id, pages: first, replace: false });
@@ -429,9 +412,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── counts ────────────────────────────────────────────────────────────── */
-
-  describe('counts (FR-ADMIN-008)', () => {
+  describe('counts', () => {
     it('countByManga counts only chapters a reader may see', async () => {
       const published = await chapters.create({ mangaId, number: 1, title: 'a', notes: '' });
       await chapters.setPublished(published, true);
@@ -449,9 +430,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── NFR-SEC-015 ───────────────────────────────────────────────────────── */
-
-  describe('queries are parameterised', () => {
+  describe('parameterised only', () => {
     it('a SQL payload in a chapter title is inert data', async () => {
       const payload = "'; drop table chapter; --";
       const id = await chapters.create({ mangaId, number: 1, title: payload, notes: payload });
@@ -462,9 +441,7 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
     });
   });
 
-  /* ── the EXPLAIN gate: ix_chapters_manga_order + the chapter_page PK ───── */
-
-  describe('hot queries use indexes (EXPLAIN gate)', () => {
+  describe('EXPLAIN gate', () => {
     it('the chapter list is index-backed, never a seq scan of chapter', async () => {
       // 20 manga × 100 chapters = 2 000 rows, so the planner must prefer the
       // (manga_id, reading_order) index over scanning the whole table.
@@ -499,19 +476,19 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(listPlan).not.toMatch(/Seq Scan on chapter/);
       expect(listPlan).toContain('ix_chapters_manga_order');
 
-      // The page list (T-READER-002; reader-behavior §15's 500-page case).
+      // The page list (the 500-page case).
       //
       // The corpus has to be big enough that a sequential scan is genuinely the
       // WRONG plan, or the assertion below would be asserting a falsehood: with
       // a few thousand page rows in the table, reading 500 of them under
       // `random_page_cost = 4` really IS cheaper to scan and sort, and no index
-      // can change that. DATA_MODEL §20's reference scale is 5 000 000 pages, so
+      // can change that. The reference scale is 5 000 000 pages, so
       // this builds ~4 % of it — every one of the 2 000 chapters gets 100 pages
       // and the first chapter of each manga gets the full 500 (the deep-link
       // case). A seq scan of 208 000 rows per page request is exactly what the
       // gate forbids.
       //
-      // `ix_pages_asset_key` is UNIQUE (FR-MEDIA-003: an unguessable key never
+      // `ix_pages_asset_key` is UNIQUE (an unguessable key never
       // names two pages), so the generated key carries the chapter id.
       // One statement to learn every corpus chapter, in reading order, so the
       // fixture does not make 2 000 round trips of its own.
@@ -561,15 +538,13 @@ describeDb('INT-CHAP-001 / T-CATALOG-001 — ChapterRepository on a real Postgre
       expect(pagePlan).not.toMatch(/Seq Scan on chapter_page/);
       // Which INDEX SCAN SHAPE PostgreSQL picks (a plain ordered range scan vs a
       // bitmap heap scan plus a sort) is its cost decision at this table size, so
-      // the gate asserts the index that is named in DATA_MODEL §10 and the
+      // the gate asserts the named index and the
       // absence of a sequential scan — not the node type, which would make the
       // gate a hostage to the planner.
       expect(pagePlan).toContain('chapter_page_chapter_id_page_number_pk');
     });
   });
 });
-
-/* ── fixture writers (generated test data only) ─────────── */
 
 async function createManga(
   harness: Harness,
