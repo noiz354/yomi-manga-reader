@@ -1,110 +1,18 @@
 #!/usr/bin/env node
 // @ts-check
 /**
- * scripts/seed.mjs — the dev/test seed harness. Deterministic collections of
- * synthetic data (gradient pages — test data, never product content) written
- * through the same repositories the app uses, never hardcoded in features.
- * Typed env at boot; no credential in the repository; production is refused.
- * Parameterized statements only; every row obeys the schema's own constraints.
+ * scripts/seed.mjs — the dev/test seed harness.
+ * Plain JS with `// @ts-check` (runs as `tsx scripts/seed.mjs`): parseable as
+ * JavaScript, type-checked against the Drizzle schema.
+ * Two fresh runs produce a byte-identical report: ids are pure functions of each
+ * natural key, and no clock, hostname or random value is written.
+ * The writer is insert-only (`ON CONFLICT DO NOTHING` + SELECTs; no UPDATE/DELETE/
+ * DDL), so re-running is safe. Production is refused from both `--env` and
+ * `NODE_ENV`; credentials come only from the environment and every fixture is synthetic.
  *
- * The file is plain JavaScript with JSDoc types (like the three gate scripts in
- * this directory) because `npm run seed` runs it as `tsx scripts/seed.mjs`:
- * a `.mjs` extension must stay parseable as JavaScript. `// @ts-check` means
- * `tsc --noEmit` still verifies every statement below against the Drizzle
- * schema, so a renamed column is a compile error, not a runtime surprise.
+ * Phase two: keys are delivery-valid AND bytes are written; the upload pipeline
+ * and its GC have not run. A seeded catalog is not proof that upload ingest works.
  *
- * ══ RUN IT ══════════════════════════════════════════════════════════════
- *   npm run seed -- --env dev
- *   npm run seed -- --env test --run-id ci-7 --load-titles 10000
- * Flags: --env dev|test (REQUIRED), --run-id, --manga, --load-titles,
- *        --page-size WxH, --chunk-size, --timings, --help.
- * Exit codes: 0 ok · 1 unexpected failure · 2 refused (guard/configuration/
- *             credential) · 4 the schema is not migrated.
- * ═══════════════════════════════════════════════════════════════════════
- *
- * Page keys are delivery-valid AND page bytes are written. Covers are still
- * keyed handles with no bytes behind them. Concretely:
- *   - Every `chapter_page.asset_key` is an opaque deterministic base key
- *     (`pageAssetKey`), and its three variants are WRITTEN to
- *     `pages/{chapterId}/{assetKey}.{ext}` through `ObjectStoragePort` — the
- *     same storage the app reads from — so a seeded page is deliverable.
- *   - Every `manga.cover_asset_key` is written as a `seed/v1/cover/` handle
- *     for now; cover bytes are not rendered yet, so covers 404 until the
- *     cover half of the pipeline lands.
- *   - The synthetic images ARE generated (in memory, with sharp) and their
- *     TRUE dimensions and variant byte sizes are recorded on every row
- *     (DATA_MODEL §10 `byte_size_avif|webp|jpeg`, the NFR-PERF-009 record).
- *   - The seed's deterministic keys remain the documented fixture state,
- *     not production ingest.
- *
- * ── Determinism ────────────────────────────────────────────────────────────
- * Two fresh runs produce byte-identical stdout (the report):
- * 1. Titles are numbered — "Seed Manga 0001", "Seed Manga 0030-Pages",
- *    "Seed Manga 0500-Pages" (the task's example, and the two cases
- *    TEST_STRATEGY §6 / reader-behavior.md §15 name).
- * 2. Every primary key is a pure function of the row's natural key
- *    (`deterministicUuid`), so ids do not drift between runs. They are
- *    v7-SHAPED (version/variant nibbles) but deliberately not time-ordered: a
- *    fixture that re-minted its ids on every run could not be diffed.
- * 3. Asset keys are `sha256(slug|chapter|page)` truncated to 32 hex.
- * 4. The seeded page geometry is fixed (480x720 by default).
- * 5. No timestamp, duration, hostname or random value is ever written to the
- *    report. Timings go to stderr through the logger, and the 500-page budget
- *    is reported there (the `< 60 s` edge case of the task).
- * 6. `created_at`/`updated_at` are left to the schema's server-side default and
- *    are NEVER written here, so a re-created row is identical.
- * One thing is deliberately NOT deterministic: the Argon2id hash of a seeded
- * password, because the salt is random. It is written once, on insert, and a
- * re-run can never rewrite it (this writer issues no UPDATE) — a re-hash would
- * invalidate every live session and would make the fixture non-deterministic.
- *
- * ── Idempotency ────────────────────────────────────────────────────────────
- * "Re-running is safe" is true by construction rather than by a code path: this
- * harness issues INSERT … ON CONFLICT DO NOTHING and plain SELECTs, and
- * **nothing else** — no UPDATE, no DELETE, no DDL. A fixture writer that can
- * only add rows cannot corrupt a database, cannot resurrect a soft-deleted row
- * and cannot destroy hand-made test data. A row that already exists is counted
- * as existing, not rewritten, so the second run reports zero writes. In
- * `--env test` every public identity (slug, email, alias, asset key) is
- * key-prefixed per run (`--run-id`) so CI jobs cannot collide; in `--env dev`
- * there is no prefix, which is what makes a re-run a pure no-op.
- *
- * ── Repositories, not raw inserts ──────────────────────────────────────────
- * `writeSeedPlan` takes a REPOSITORY BUNDLE as an argument and knows nothing
- * about SQL. `createSeedRepositories(db)` supplies the Drizzle-backed
- * implementation; the unit test supplies an in-memory one. The methods mirror
- * the feature ports the app will use (T-CATALOG-001 / T-AUTH-001):
- *   `users.create`            ← UserRepository.create   (T-AUTH-001)
- *   `manga.create`            ← MangaRepository.create  (T-CATALOG-001)
- *   `chapters.commitChapter`  ← ChapterRepository.create + commitPages
- * The seed-scoped additions, and why each is necessary, are documented on the
- * methods themselves. Two structural notes:
- *   - This file imports NO runtime symbol from `drizzle-orm`: every statement is
- *     reached through the `Db` handle `createDb(env)` returns (boundary rule D2 —
- *     the application owns its SQL; this is a dev tool, not a module of the
- *     app). `drizzle-orm` appears in JSDoc type positions only, which emit no
- *     import at runtime.
- *   - Until T-CATALOG-001 lands the real implementations in
- *     `src/server/db/repositories/`, the harness is their temporary home. That is
- *     the smallest coherent change available inside this task's write scope
- *     (`src/**` is not writable here) and it is recorded as such.
- *
- * ── Boundaries this harness does NOT cross ────────────────────────────────
- *   - It does not run migrations (the app role is
- *     DML-only). It REFUSES with exit 4 when the schema is absent.
- *   - It reads the environment through `loadEnv()` only, never field by field.
- *     The two `SEED_*PASSWORD` names are the single documented exception and
- *     they are read from the SAME source object handed to `loadEnv`, because
- *     DEPLOYMENT.md §3 has no seed variables; they are read from the same
- *     source object handed to `loadEnv`.
- *   - It writes no product content, ever. Every title, alias, creator name,
- *     synopsis and image is generated here; the genre/tag vocabulary is generic
- *     category words, and the images are gradients computed in memory.
- *   - It refuses `NODE_ENV=production` from BOTH directions — an explicit
- *     `--env production`, and a `production` process env behind a `--env dev`
- *     flag (UNIT-SEED-002). Seeded passwords come from the environment, so a
- *     production DSN would receive a KNOWN credential row: that is the security
- *     control this file exists to enforce, not an afterthought.
  */
 
 import { createHash } from 'node:crypto';
@@ -115,8 +23,6 @@ import * as dbSchema from '../src/server/db/schema';
 import { createObjectStorageAsync } from '../src/server/storage/object-storage';
 import { createLogger } from '../src/server/telemetry/logger';
 import { loadEnv } from '../src/shared/validation';
-
-/* ── types (JSDoc, so a `.mjs` file stays parseable JavaScript) ───────────── */
 
 /** The application's Drizzle handle, from the only module allowed to build it. */
 /** @typedef {import('../src/server/db/client').Db} Db */
@@ -130,7 +36,7 @@ import { loadEnv } from '../src/shared/validation';
 /** @typedef {{ email: string, displayName: string, passwordHash: string, role: 'admin'|'reader' }} SeedUserInput */
 /** One creator as planned. */
 /** @typedef {{ name: string, role: 'author'|'artist' }} SeedCreatorSpec */
-/** One rendered page, as written to `chapter_page` (DATA_MODEL §10). */
+/** One rendered page, as written to `chapter_page`. */
 /** @typedef {{ pageNumber: number, assetKey: string, width: number, height: number, byteSizeAvif: number, byteSizeWebp: number, byteSizeJpeg: number }} SeedPageRecord */
 /** What a page renderer reports: the geometry and the variant sizes. */
 /**
@@ -160,9 +66,9 @@ import { loadEnv } from '../src/shared/validation';
 /** @typedef {{ vocabulary: { genresCreated: number, tagsCreated: number, creatorsCreated: number }, users: { created: number }, manga: { created: number, links: number, loadTitlesCreated: number }, chapters: { created: number }, pages: { written: number }, ids: { reserved: number } }} SeedWriteStats */
 /** The rows `manga.create` accepts: the port's fields plus the two seed additions. */
 /** @typedef {{ title: string, slug: string, synopsis: string, status: string, readingDirection: string, published: boolean, coverAssetKey: string, aliases: readonly string[], genreIds: readonly string[], tagIds: readonly string[], creators: readonly { creatorId: string, role: string }[] }} SeedMangaInput */
-/** Mirrors `UserRepository.create` (T-AUTH-001) with the two seed additions. */
+/** Mirrors `UserRepository.create` with the two seed additions. */
 /** @typedef {{ create: (input: SeedUserInput) => Promise<string> }} SeedUserRepository */
-/** Mirrors `MangaRepository.create` (T-CATALOG-001) plus the vocabulary lookups. */
+/** Mirrors `MangaRepository.create` plus the vocabulary lookups. */
 /** @typedef {{ ensureGenres: (names: readonly string[]) => Promise<Map<string, string>>, ensureTags: (names: readonly string[]) => Promise<Map<string, string>>, ensureCreators: (specs: readonly SeedCreatorSpec[]) => Promise<Map<string, string>>, create: (input: SeedMangaInput) => Promise<string>, createLoadTitles: (titles: readonly { title: string, slug: string, genreId: string, tagId: string, alias: string }[]) => Promise<number> }} SeedMangaRepository */
 /** The chapter port's `create` + `commitPages`, FUSED into one transaction. */
 /** @typedef {{ commitChapter: (input: { mangaId: string, number: string, title: string, notes: string, published: boolean, pages: readonly SeedPageRecord[], replace: boolean }) => Promise<{ chapterId: string, created: boolean, pagesWritten: number }> }} SeedChapterRepository */
@@ -170,9 +76,8 @@ import { loadEnv } from '../src/shared/validation';
  * The subset of the feature ports the seed writes through. The unit test
  * implements it in memory; `createSeedRepositories` implements it with Drizzle.
  * Every method is INSERT-shaped, which is the deliberate consequence of the
- * insert-only writer (see the header): without a `where` the harness can express
- * "create if absent" and nothing else — precisely the surface a fixture loader
- * should have.
+ * insert-only writer: without a `where` the harness can express "create if absent"
+ * and nothing else — precisely the surface a fixture loader should have.
  * @typedef {{ users: SeedUserRepository, manga: SeedMangaRepository, chapters: SeedChapterRepository, stats: () => SeedWriteStats }} SeedRepositories
  */
 /** The parsed command line. `mode` is undefined until `--env` is given. */
@@ -192,8 +97,6 @@ import { loadEnv } from '../src/shared/validation';
 /** One `chapter_page` row, exactly as the table declares it. */
 /** @typedef {{ chapterId: string, pageNumber: number, assetKey: string, width: number, height: number, byteSizeAvif: number, byteSizeWebp: number, byteSizeJpeg: number }} SeedPageRow */
 
-/* ── exit codes (documented in the header) ───────────────────────────────── */
-
 /** The run finished; the report is on stdout. */
 export const EXIT_OK = 0;
 /** Something failed that is not a refusal (a bug, or an unreachable database). */
@@ -203,17 +106,14 @@ export const EXIT_REFUSED = 2;
 /** The database is reachable but the schema has not been migrated. */
 export const EXIT_NO_SCHEMA = 4;
 
-// Stable namespace for deterministic ID derivation. The value is part of
-// every seeded UUID — changing it re-keys the whole fixture set.
-export const SEED_TASK_ID = 'T-FOUND-012';
+/** Stamped into deterministic hashes and CLI messages. */
+export const SEED_SIGNATURE = 'yomi-v1';
 
-/* ── fixture vocabulary (generic category words, not product content) ──────── */
-
-/** The `manga.status` CHECK values (DATA_MODEL §3), cycled across fixtures. */
+/** The `manga.status` CHECK values, cycled across fixtures. */
 /** @type {ReadonlyArray<'ongoing'|'completed'|'hiatus'>} */
 const MANGA_STATUSES = ['ongoing', 'completed', 'hiatus'];
 
-/** Genres: the controlled catalog vocabulary (DATA_MODEL §6). */
+/** Genres: the controlled catalog vocabulary. */
 /** @type {ReadonlyArray<string>} */
 const GENRE_VOCABULARY = [
   'Action',
@@ -226,7 +126,7 @@ const GENRE_VOCABULARY = [
   'Romance',
 ];
 
-/** Freeform search tags (DATA_MODEL §7). */
+/** Freeform search tags. */
 /** @type {ReadonlyArray<string>} */
 const TAG_VOCABULARY = [
   'long-running',
@@ -251,10 +151,10 @@ const USER_SPECS = [
   { email: 'seed-reader@seed.invalid', displayName: 'Seed Reader', role: 'reader' },
 ];
 
-/** The 500-page case: the product's defining performance case (reader-behavior §15). */
+/** The 500-page case: the product's defining performance case. */
 /** @type {Readonly<{ title: string, slug: string, pageCount: number }>} */
 const MARATHON_MANGA = { title: 'Seed Manga 0500-Pages', slug: 'seed-manga-0500-pages', pageCount: 500 };
-/** The 30-page case: E2E-READER-001 scrolls this one. */
+/** The 30-page case. */
 /** @type {Readonly<{ title: string, slug: string, pageCount: number }>} */
 const THIRTY_PAGE_MANGA = { title: 'Seed Manga 0030-Pages', slug: 'seed-manga-0030-pages', pageCount: 30 };
 
@@ -267,10 +167,10 @@ const ORDINARY_CHAPTER_PAGES = 8;
 export const DEFAULT_PAGE_SIZE = { width: 480, height: 720 };
 /** Pages rendered per chunk: bounds peak memory and makes progress visible. */
 export const DEFAULT_CHUNK_SIZE = 64;
-/** The task's edge-case budget for the 500-page chapter, in milliseconds. */
+/** Edge-case budget for the 500-page chapter, in milliseconds. */
 export const PAGE_SEED_BUDGET_MS = 60_000;
 /**
- * The first number the optional 10k-title load fixture uses (INT-SEARCH-001).
+ * The first number the optional 10k-title load fixture uses.
  * A five-digit block of its own, so a load title can never collide with an
  * ordinary one and a sorted catalog still reads as one sequence.
  */
@@ -285,11 +185,9 @@ const SEED_UUID_PREFIX = '594f4d49';
 /** The publication stamp a seeded row carries: a constant, so a re-create is identical. */
 const PUBLISHED_AT = new Date('2026-01-01T00:00:00.000Z');
 
-/* ── refusals ────────────────────────────────────────────────────────────── */
-
 /**
  * A refusal: the harness decided NOT to run. Carries a reason code and a
- * message that names the flag or VARIABLE only — never a value (NFR-OBS-006).
+ * message that names the flag or VARIABLE only — never a value.
  */
 export class SeedRefusal extends Error {
   /**
@@ -317,13 +215,11 @@ export class MissingSchemaError extends Error {
   }
 }
 
-/* ── argument parsing ────────────────────────────────────────────────────── */
-
 /** The NODE_ENV each mode implies. @type {Readonly<Record<SeedMode, string>>} */
 const MODE_NODE_ENV = { dev: 'development', test: 'test' };
 
 /** The `--help` text; the single source of the usage. */
-export const USAGE = `yomi seed harness (${SEED_TASK_ID}) — deterministic dev/test fixtures.
+export const USAGE = `yomi seed harness — deterministic dev/test fixtures.
 
   npm run seed -- --env dev
   npm run seed -- --env test --run-id ci-7 --load-titles 10000
@@ -339,7 +235,7 @@ export const USAGE = `yomi seed harness (${SEED_TASK_ID}) — deterministic dev/
 
 Account credentials come from the environment: SEED_ADMIN_PASSWORD and
 SEED_READER_PASSWORD (one shared SEED_PASSWORD is accepted for both). There is
-no default and no literal in this repository (NFR-SEC-009).
+no default and no literal in this repository.
 `;
 
 /**
@@ -453,7 +349,7 @@ export function parseSeedArgs(argv) {
         break;
       case '--manga':
         // 0 is legal and useful: "only the 30-page and 500-page fixtures" is
-        // how the marathon case is timed on its own (the task's edge case).
+        // how the marathon case is timed on its own.
         args.mangaCount = nonNegativeInteger(flag, value());
         break;
       case '--load-titles':
@@ -477,8 +373,6 @@ export function parseSeedArgs(argv) {
   }
   return args;
 }
-
-/* ── guard 1: the explicit mode (the security control) ───────────────────── */
 
 /**
  * Refuses anything that is not explicitly a dev or a test seed.
@@ -526,11 +420,8 @@ export function assertSeedMode(input) {
   return { mismatch: input.nodeEnv !== MODE_NODE_ENV[requested] };
 }
 
-/* ── guard 2: the seeded credential (never a literal) ────────────────────── */
-
 /**
- * A blank value is an unset value, exactly as `loadEnv` treats one
- * (DEPLOYMENT.md §3 ships both spellings for "off").
+ * A blank value is an unset value, exactly as `loadEnv` treats one.
  * @param {string|undefined} value
  * @returns {string|undefined}
  */
@@ -542,7 +433,7 @@ function present(value) {
 /**
  * Reads the seeded account credentials from the environment source that was
  * handed to `loadEnv`. There is no default, no generated value and no literal
- * anywhere: with nothing in the environment the run is refused (UNIT-SEED-003).
+ * anywhere: with nothing in the environment the run is refused.
  *
  * @param {Record<string, string|undefined>} source the same object given to `loadEnv`
  * @returns {SeedPasswords}
@@ -557,18 +448,16 @@ export function readSeedPasswords(source) {
       'password-missing',
       'Refused: the seeded account credential must come from the environment. Set ' +
         'SEED_ADMIN_PASSWORD and SEED_READER_PASSWORD (or one SEED_PASSWORD for ' +
-        'both). This repository contains no default, by design (NFR-SEC-009).',
+        'both). This repository contains no default, by design.',
     );
   }
   return { admin, reader };
 }
 
-/* ── deterministic identity ──────────────────────────────────────────────── */
-
 /**
  * A deterministic, v7-SHAPED uuid derived from a natural key. Shape only: the
  * timestamp field is a fixed constant, so ids are stable across runs and rows
- * stay comparable, at the cost of the time ordering DATA_MODEL line 6 buys in
+ * stay comparable, at the cost of the insertion-time ordering the schema buys in
  * production (a fixture does not paginate by insertion time).
  *
  * @param {string} kind the table name, so two tables never share an id
@@ -576,11 +465,11 @@ export function readSeedPasswords(source) {
  * @returns {string}
  */
 export function deterministicUuid(kind, key) {
-  const digest = createHash('sha256').update(`${SEED_TASK_ID}/${kind}/${key}`).digest('hex');
+  const digest = createHash('sha256').update(`${SEED_SIGNATURE}/${kind}/${key}`).digest('hex');
   return [
     SEED_UUID_PREFIX,
     digest.slice(0, 4),
-    // version 7 (UUIDv7 layout, DATA_MODEL line 6)
+    // version 7 (UUIDv7 layout)
     `7${digest.slice(4, 7)}`,
     // variant 10xx, then three more hex digits
     `${'89ab'[Number.parseInt(digest[7] ?? '0', 16) % 4]}${digest.slice(8, 11)}`,
@@ -589,19 +478,17 @@ export function deterministicUuid(kind, key) {
 }
 
 /**
- * The opaque asset key for one page (FR-MEDIA-003: an unguessable handle, never a
- * path and never derivable from the row ids).
+ * The opaque asset key for one page: an unguessable handle, never a path and
+ * never derivable from the row ids.
  *
- * This used to be prefixed `seed/v1/`, which made every seeded page undeliverable. The
- * delivery key grammar in `server/media/page-delivery.ts` is
+ * The delivery key grammar in `server/media/page-delivery.ts` is
  * `/^([A-Za-z0-9_-]{22,64})\.(avif|webp|jpeg)$/` — one path segment, no slashes — so
- * `parseDeliveryKey` returned `null` and `/media/seed/v1/<digest>.jpeg` 404'd before
- * touching storage. The 32 hex characters were always valid on their own; the prefix
- * was what broke it.
+ * anything with a slash makes `parseDeliveryKey` return `null` and the request 404s
+ * before touching storage. The 32 hex characters are valid on their own.
  *
- * The OBJECT, however, is still stored under the physical layout ADR-004 defines,
- * `pages/{chapterId}/{assetKey}.{ext}` (see `pageObjectKey`). The URL carries only the
- * opaque key; the chapter directory is resolved server-side from the page row.
+ * The OBJECT is stored under the physical layout `pages/{chapterId}/{assetKey}.{ext}`
+ * (see `pageObjectPathFor`). The URL carries only the opaque key; the chapter
+ * directory is resolved server-side from the page row.
  *
  * @param {{ slug: string, chapterNumber: string, pageNumber: number }} input
  * @returns {string}
@@ -633,11 +520,9 @@ export function chapterIdFor(input) {
  *
  * This is the same layout `pageObjectKey` in src/server/storage builds, and it must stay
  * identical to it — the delivery route resolves the chapter directory from the page row, so
- * a seed that writes anywhere else produces an object no request will ever name. Written
- * here as its own function, and mirrored by a test, because when it was inlined in the
- * writer nothing could reach it: the suite that claims to check "the path the seed wrote"
- * was building the path itself and would have passed against a seed that wrote to the bare
- * key.
+ * a seed that writes anywhere else produces an object no request will ever name. It is its
+ * own function, and mirrored by a test, so that test checks the path the seed actually
+ * wrote rather than rebuilding the path itself.
  *
  * @param {{ slug: string, chapterNumber: string, pageNumber: number, ext: string }} input
  * @returns {string}
@@ -651,7 +536,40 @@ export function pageObjectPathFor(input) {
   })}.${input.ext}`;
 }
 
-/* ── the plan (pure) ─────────────────────────────────────────────────────── */
+/**
+ * The opaque base key a manga's cover is stored under.
+ *
+ * A cover key is the same kind of thing as a page key (an opaque, unguessable,
+ * layout-free handle), so it is derived the same way: 128 bits of digest, hex, one
+ * URL segment. A slash or a missing extension makes `parseDeliveryKey` return null,
+ * so the request 404s before storage is ever consulted. The manga directory is the
+ * server's business (`covers/{mangaId}.{ext}`), not the key's — exactly the split
+ * the page pipeline already uses.
+ *
+ * @param {{ slug: string }} input
+ * @returns {string}
+ */
+export function coverAssetKey(input) {
+  return createHash('sha256').update(`cover|${input.slug}`).digest('hex').slice(0, 32);
+}
+
+/**
+ * Where one cover variant's OBJECT goes: `covers/{mangaId}.{ext}`.
+ *
+ * The same layout `coverObjectKey` in src/server/storage builds, and it must
+ * stay identical to it — the delivery route resolves the cover from the manga
+ * row, so a seed that writes anywhere else produces an object no request will
+ * ever name. It is its own function, and mirrored by a test, for the same reason
+ * `pageObjectPathFor` exists: a path inlined in the writer is a path the test
+ * would otherwise rebuild rather than check.
+ *
+ * @param {{ slug: string, ext: string }} input
+ * @returns {string}
+ */
+export function coverObjectPathFor(input) {
+  const mangaId = deterministicUuid('manga', input.slug);
+  return `covers/${mangaId}.${input.ext}`;
+}
 
 /**
  * `count` names starting at `from`, wrapping — deterministic, and it spreads
@@ -682,7 +600,7 @@ function chapterSpec(number, title, published, pageCount) {
     // numeric(8,2) as a string: 1.00, never 1 (the column is exact numeric)
     number: number.toFixed(2),
     title,
-    notes: 'Seeded by the T-FOUND-012 harness. Synthetic pages, no product content.',
+    notes: 'Seeded by the harness. Synthetic pages, no product content.',
     published,
     pageCount,
     pages: [],
@@ -703,7 +621,7 @@ function chapterSpec(number, title, published, pageCount) {
 function ordinaryManga(input) {
   const index = input.index;
   const padded = String(index).padStart(4, '0');
-  // Cycle the enum-ish columns so every CHECK in DATA_MODEL §3/§9 has a
+  // Cycle the enum-ish columns so every CHECK has a
   // fixture: a reader page that only ever sees one value cannot prove the rule.
   const status = MANGA_STATUSES[(index - 1) % 3] ?? 'ongoing';
   const readingDirection = index % 2 === 0 ? 'ltr' : 'rtl';
@@ -714,18 +632,18 @@ function ordinaryManga(input) {
     slug,
     synopsis:
       `Synthetic fixture synopsis for Seed Manga ${padded}. Generated by the ` +
-      'T-FOUND-012 seed harness; not a real title and not product content.',
+      'Seed harness; not a real title and not product content.',
     status,
     readingDirection,
     aliases: [`${input.keyPrefix}Seed Manga ${padded} (Alt)`, `${input.keyPrefix}Serie ${padded}`],
     genreNames: pick(input.genreNames, index, 2),
     tagNames: pick(input.tagNames, index, 3),
     creators: input.creators,
-    coverAssetKey: `seed/v1/cover/${createHash('sha256').update(slug).digest('hex').slice(0, 32)}`,
+    coverAssetKey: coverAssetKey({ slug }),
     chapters: [
       chapterSpec(1, `${padded} — opening`, true, input.pages),
       chapterSpec(2, `${padded} — middle`, true, input.pages),
-      // A draft: unpublished, so the reader's visibility rule (FR-CHAPTER-002)
+      // A draft: unpublished, so the reader's visibility rule
       // and the admin publish path both have a fixture to work on.
       chapterSpec(3, `${padded} — draft`, false, input.pages),
     ],
@@ -751,21 +669,21 @@ function specialManga(input) {
     slug,
     synopsis:
       `Synthetic fixture: ${String(input.pageCount)} generated gradient pages. The ` +
-      'reader performance case (reader-behavior.md §15); no product content.',
+      'reader performance case; no product content.',
     status: 'ongoing',
     readingDirection: 'rtl',
     aliases: [`${slug} (fixture)`],
     genreNames: pick(input.genreNames, input.pageCount, 2),
     tagNames: pick(input.tagNames, input.pageCount, 3),
     creators: input.creators,
-    coverAssetKey: `seed/v1/cover/${createHash('sha256').update(slug).digest('hex').slice(0, 32)}`,
+    coverAssetKey: coverAssetKey({ slug }),
     chapters: [chapterSpec(1, 'the whole chapter', true, input.pageCount)],
   };
 }
 
 /**
  * Builds the whole seed as data. Pure: no clock, no randomness, no I/O, so two
- * calls with the same options are byte-identical (UNIT-SEED-004) and the plan
+ * calls with the same options are byte-identical and the plan
  * can be asserted without a database.
  *
  * @param {SeedPlanOptions} options
@@ -838,8 +756,6 @@ export function buildSeedPlan(options) {
   };
 }
 
-/* ── synthetic pages (in memory, never on disk) ──────────────────────────── */
-
 /**
  * sharp is loaded once, lazily, so importing this module stays cheap (a unit
  * test that never renders a page never pays for the native module).
@@ -887,21 +803,19 @@ export function grayscaleGradient(width, height, pageNumber) {
  *
  * The image is a deterministic grayscale gradient computed in a raw buffer in
  * memory: no file is read, no file is written, no network call is made, and no
- * byte of it comes from anywhere but this function. That is the whole point:
- * a licensed-content reader must never carry
- * real artwork into a repository, a test fixture or a CI cache, and a gradient
- * cannot be mistaken for a scan.
+ * byte of it comes from anywhere but this function: a licensed-content reader
+ * must never carry real artwork into a repository, a test fixture or a CI cache,
+ * and a gradient cannot be mistaken for a scan.
  *
  * The three encoded variants exist so the recorded `byte_size_*` columns are
- * measurements of a real encode (DATA_MODEL §10, the NFR-PERF-009 record) rather
- * than invented numbers.
+ * measurements of a real encode, not invented numbers.
  *
- * The encoded buffers are RETURNED so the caller can put them in object storage.
- * They used to be dropped here, which left every seeded page row pointing at an
- * object that did not exist: `/media/{assetKey}.jpeg` answered 404 and the reader
- * rendered broken images. The buffers are still never written to the repository
- * or committed — they go to whatever `ObjectStoragePort` the environment selects
- * (a local directory, or S3/R2), which is the same place a real upload puts them.
+ * The encoded buffers are RETURNED so the caller can put them in object storage:
+ * without them every seeded page row would point at an object that did not exist,
+ * `/media/{assetKey}.jpeg` would answer 404 and the reader would render broken
+ * images. They are never written to the repository or committed — they go to
+ * whatever `ObjectStoragePort` the environment selects (a local directory, or
+ * S3/R2), the same place a real upload puts them.
  *
  * The returned buffers are live and are not safe to retain: a 500-page chapter
  * held at once is hundreds of MB. `materialisePages` therefore uploads inside its
@@ -916,8 +830,8 @@ export async function renderSyntheticPage(spec) {
   /** @type {import('sharp').SharpOptions} */
   const input = { raw: { width: spec.width, height: spec.height, channels: 1 } };
   // AVIF effort 0 is deliberate: it is ~5x faster than the default for a fixture
-  // whose only consumer is a byte-size column, and the 500-page budget
-  // (< 60 s, the task's edge case) is what it buys.
+  // whose only consumer is a byte-size column, and that is what keeps the 500-page
+  // run inside its 60 s budget.
   const [avif, webp, jpeg] = await Promise.all([
     sharp(raw, input).avif({ effort: 0 }).toBuffer(),
     sharp(raw, input).webp().toBuffer(),
@@ -931,6 +845,52 @@ export async function renderSyntheticPage(spec) {
     byteSizeJpeg: jpeg.length,
     digest: createHash('sha256').update(avif).digest('hex').slice(0, 16),
     avif,
+    webp,
+    jpeg,
+  };
+}
+
+/**
+ * Cover art dimensions: 2:3, the design's cover proportion (the hi-fi set;
+ * `cover-image.tsx` reserves the box at 600×900). Under the 1200 px ceiling, so
+ * no downscale step is needed.
+ */
+export const SYNTHETIC_COVER_WIDTH = 600;
+export const SYNTHETIC_COVER_HEIGHT = 900;
+
+/**
+ * Renders ONE synthetic cover and reports its real geometry and variant sizes.
+ *
+ * Same synthetic-gradient technique as `renderSyntheticPage` (no file read, no
+ * network, nothing but this function), but WebP + JPEG ONLY: covers are stored in
+ * those two variants (`coverObjectKey`), so an AVIF encode would be a third of the
+ * cover budget spent on bytes no request can name. The gradient tilt is derived
+ * from the slug so covers differ from each other the way pages differ by page
+ * number — deterministically.
+ *
+ * The encoded buffers are RETURNED for the caller to put in object storage
+ * (the same arrangement as pages). They are live and not safe to retain; the
+ * seed writes each cover inside its loop and lets the buffers fall out of
+ * scope.
+ *
+ * @param {{ slug: string }} spec
+ * @returns {Promise<{ width: number, height: number, byteSizeWebp: number, byteSizeJpeg: number, webp: Buffer, jpeg: Buffer }>}
+ */
+export async function renderSyntheticCover(spec) {
+  const sharp = await loadSharp();
+  const tiltSeed = Number.parseInt(createHash('sha256').update(spec.slug).digest('hex').slice(0, 8), 16);
+  const raw = grayscaleGradient(SYNTHETIC_COVER_WIDTH, SYNTHETIC_COVER_HEIGHT, tiltSeed % 997);
+  /** @type {import('sharp').SharpOptions} */
+  const input = { raw: { width: SYNTHETIC_COVER_WIDTH, height: SYNTHETIC_COVER_HEIGHT, channels: 1 } };
+  const [webp, jpeg] = await Promise.all([
+    sharp(raw, input).webp().toBuffer(),
+    sharp(raw, input).jpeg({ quality: 80 }).toBuffer(),
+  ]);
+  return {
+    width: SYNTHETIC_COVER_WIDTH,
+    height: SYNTHETIC_COVER_HEIGHT,
+    byteSizeWebp: webp.length,
+    byteSizeJpeg: jpeg.length,
     webp,
     jpeg,
   };
@@ -1027,8 +987,6 @@ export async function materialisePages(plan, options = {}) {
   return { ...plan, manga };
 }
 
-/* ── the writer ──────────────────────────────────────────────────────────── */
-
 /**
  * A vocabulary name must resolve to an id, or the plan is internally broken.
  * @param {Map<string, string>} ids
@@ -1090,7 +1048,7 @@ export async function writeSeedPlan(plan, repositories, options) {
   // handed to a second `writeSeedPlan` still reports the first run's totals.
   // The report must be about THIS run, so every counter is a delta against a
   // snapshot taken before the first write. That delta is what makes a re-run's
-  // report read "0 created" (and what INT-SEED-002 asserts).
+  // report read "0 created".
   const baseline = repositories.stats();
 
   const [genreIds, tagIds, creatorIds] = await Promise.all([
@@ -1175,8 +1133,6 @@ export async function writeSeedPlan(plan, repositories, options) {
   return stats;
 }
 
-/* ── the Drizzle-backed repositories ─────────────────────────────────────── */
-
 /**
  * @param {string} chapterId
  * @param {SeedPageRecord} page
@@ -1211,8 +1167,8 @@ function roleOf(specs, name) {
  * Import boundary: this function takes the handle `createDb(env)` returns and
  * the schema objects, and imports NO runtime symbol from `drizzle-orm` — every
  * statement goes through the handle's query builder, which binds every value as
- * a parameter (NFR-SEC-015). No `sql.unsafe`, no `sql.raw`, no string-built
- * template, and no DDL (the app role is DML-only).
+ * a parameter. No `sql.unsafe`, no `sql.raw`, no string-built template, and no DDL
+ * (the app role is DML-only).
  * `// @ts-check` still verifies every inserted object against the schema's
  * inferred column types, so a renamed column fails `tsc`, not production.
  *
@@ -1244,7 +1200,7 @@ export function createSeedRepositories(db) {
             email: input.email,
             displayName: input.displayName,
             // the hash the plan carries; a re-run conflicts on the email and
-            // therefore never re-hashes (see the header on determinism)
+            // therefore never re-hashes
             passwordHash: input.passwordHash,
             role: input.role,
           })
@@ -1280,7 +1236,7 @@ export function createSeedRepositories(db) {
         const inserted = await db
           .insert(dbSchema.tag)
           .values([...ids].map(([name, id]) => ({ id, name })))
-          // DATA_MODEL §7 makes the tag name unique over `lower(name)`, i.e. an
+          // The tag name is unique over `lower(name)`, i.e. an
           // EXPRESSION index. PostgreSQL cannot infer such an index from a column
           // conflict target — `ON CONFLICT (name)` would raise "no unique or
           // exclusion constraint matching". The bare form accepts any unique
@@ -1373,8 +1329,8 @@ export function createSeedRepositories(db) {
       },
       /**
        * The 10k-title load fixture: titles only, batched, one link each. What
-       * INT-SEARCH-001 needs is 10k rows in `manga` to measure trigram search
-       * against (NFR-PERF-005); pages would cost 8 000 encodes for nothing.
+       * the load fixture needs is 10k rows in `manga` to measure trigram search
+       * against; pages would cost 8 000 encodes for nothing.
        *
        * @param {readonly { title: string, slug: string, genreId: string, tagId: string, alias: string }[]} titles
        * @returns {Promise<number>} how many rows were actually inserted
@@ -1387,7 +1343,7 @@ export function createSeedRepositories(db) {
             id: deterministicUuid('manga', entry.slug),
             slug: entry.slug,
             title: entry.title,
-            synopsis: `Synthetic load fixture title (${SEED_TASK_ID}). No product content.`,
+            synopsis: 'Synthetic load fixture title. No product content.',
             status: 'ongoing',
             readingDirection: 'rtl',
             published: true,
@@ -1431,9 +1387,9 @@ export function createSeedRepositories(db) {
     chapters: {
       /**
        * The chapter and its full 1..N page set become visible in ONE
-       * transaction, so a published chapter never exists without its pages
-       * (DATA_MODEL §21.3) — the property the port's `commitPages` exists to
-       * guarantee (FR-UPLOAD-006). The contiguity is asserted before the write.
+       * transaction, so a published chapter never exists without its pages —
+       * the property the port's `commitPages` exists to guarantee. The contiguity
+       * is asserted before the write.
        *
        * @param {{ mangaId: string, number: string, title: string, notes: string, published: boolean, pages: readonly SeedPageRecord[], replace: boolean }} input
        * @returns {Promise<{ chapterId: string, created: boolean, pagesWritten: number }>}
@@ -1488,7 +1444,7 @@ export function createSeedRepositories(db) {
 }
 
 /**
- * The DATA_MODEL §21.2 invariant, asserted before anything is written: pages
+ * Asserted before anything is written: pages
  * are exactly 1..N, ascending, with no duplicate asset key. A fixture that
  * violated it would be teaching the reader to tolerate a broken chapter.
  *
@@ -1509,8 +1465,6 @@ export function assertContiguousPages(pages) {
     throw new Error('seed plan error: duplicate page asset key');
   }
 }
-
-/* ── verification (read-only) ────────────────────────────────────────────── */
 
 /**
  * Reads the seeded rows back and proves the plan landed. Read-only by
@@ -1641,8 +1595,6 @@ function isLoadFixtureSlug(slug, plan) {
   return index >= plan.loadFixture.from && index < plan.loadFixture.from + plan.loadFixture.count;
 }
 
-/* ── the report (deterministic by construction) ──────────────────────────── */
-
 /**
  * Renders the report. Every line is a function of the plan, the write counters
  * and the read-back — never of a clock, a hostname, a path or a random value, so
@@ -1653,7 +1605,7 @@ function isLoadFixtureSlug(slug, plan) {
  */
 export function formatReport(report) {
   const lines = [
-    `# yomi seed harness — deterministic dev/test fixtures`,
+    `# yomi seed harness — phase one (placeholder asset keys, no media pipeline yet)`,
     `mode=${report.mode} run-id=${report.runId} key-prefix=${report.keyPrefix === '' ? '(none)' : report.keyPrefix}`,
     `pages=${String(report.pageSize.width)}x${String(report.pageSize.height)} synthetic=gradient-grayscale chunk=${String(report.chunkSize)}`,
   ];
@@ -1670,7 +1622,7 @@ export function formatReport(report) {
   lines.push(
     `load-fixture titles=${String(report.loadFixture.count)}` +
       (report.loadFixture.count === 0
-        ? ' (off; pass --load-titles 10000 for INT-SEARCH-001)'
+        ? ' (off; pass --load-titles 10000)'
         : ` first="${report.loadFixture.first}" last="${report.loadFixture.last}"`),
   );
   const totals = report.totals;
@@ -1752,10 +1704,9 @@ function buildReport(plan, writes, verification, timings) {
   };
 }
 
-/* ── the run ─────────────────────────────────────────────────────────────── */
-
 /**
- * Refuses to write into a database that has not been migrated. That is why the harness does not simply run the migrations itself: the
+ * Refuses to write into a database that has not been migrated. The harness does
+ * not simply run the migrations itself: the
  * app role is DML-only, and a fixture loader that migrates would be a second,
  * unreviewed DDL path.
  *
@@ -1777,8 +1728,7 @@ async function requireSchema(db) {
 
 /**
  * A one-line description of an unexpected failure. A DSN is scrubbed out: the
- * driver's own message can carry it, so only the class of failure is reported
- * (NFR-OBS-006).
+ * driver's own message can carry it, so only the class of failure is reported.
  *
  * @param {unknown} error
  * @returns {string}
@@ -1794,9 +1744,7 @@ function describe(error) {
  * Argon2id with the parameters `features/auth/password.ts` pins for the product
  * (m = 64 MiB, t = 3, p = 4). The seed does not choose its own: a fixture must
  * exercise the same KDF the login path verifies against, or "log in as the
- * seeded reader" would test a different hash than production. T-AUTH-002 owns
- * the policy a value must satisfy; the harness neither enforces it nor exempts
- * itself from it.
+ * seeded reader" would test a different hash than production.
  *
  * @param {string} password
  * @returns {Promise<string>} the encoded Argon2id hash
@@ -1831,14 +1779,14 @@ export async function runSeed(options) {
       return { code: EXIT_OK, timings };
     }
 
-    // The environment is read through the app's own loader and nowhere else
+    // The environment is read through the app's own loader and nowhere else.
     // Warnings go to stderr so stdout stays byte-comparable.
     const env = loadEnv(options.source, { onWarn: (message) => stderr(`${message}\n`) });
     const mode = assertSeedMode({ requested: args.mode, nodeEnv: env.nodeEnv });
     const passwords = readSeedPasswords(options.source);
 
-    // Operational logging goes to stderr; stdout is the report and nothing else
-    // (OBSERVABILITY.md §1 governs the app's log sink; a CLI needs a data stream).
+    // Operational logging goes to stderr; stdout is the report and nothing else —
+    // a CLI needs a data stream.
     const log = createLogger(env, {
       level: 'info',
       destination: /** @type {import('pino').DestinationStream} */ (process.stderr),
@@ -1879,9 +1827,8 @@ export async function runSeed(options) {
     // point is that a test can point it at a throwaway database and a local directory.
     const storage = await createObjectStorageAsync(env, options.source);
     /**
-     * `AssetKey` is a branded string (shared/types/ids.ts) and `putStream` demands it. The
-     * seed has never needed the brand before — it only ever wrote plain strings through
-     * Drizzle — so the boundary is stated here rather than assumed. Checked instead of cast,
+     * `AssetKey` is a branded string (shared/types/ids.ts) and `putStream` demands it,
+     * so the boundary is stated here rather than assumed. Checked instead of cast,
      * because a key that is not shaped like one should fail here, not at the storage adapter.
      *
      * @param {string} value
@@ -1913,7 +1860,7 @@ export async function runSeed(options) {
      * @param {{ avif: Buffer, webp: Buffer, jpeg: Buffer }} variants
      */
     const putPage = async (page, variants) => {
-      // Two different key shapes, and conflating them is what made every seeded page
+      // Two different key shapes, and conflating them is what makes a seeded page
       // undeliverable. The URL carries the OPAQUE key alone — one path segment, no
       // slashes, per the delivery grammar. The OBJECT lives at the physical layout
       // `pages/{chapterId}/{assetKey}.{ext}` that `pageObjectKey` builds server-side.
@@ -1954,6 +1901,33 @@ export async function runSeed(options) {
       );
     }
 
+    // Covers are rendered and written here — NOT in `materialisePages`, which
+    // is the page pipeline's chunk loop. One cover per plan title (WebP +
+    // JPEG), each written inside the loop and released before the next render,
+    // so peak memory stays one cover. The object path is the seed's own
+    // `coverObjectPathFor`, mirrored by a test against the product `coverObjectKey`.
+    const coverStartedAt = Date.now();
+    let coversWritten = 0;
+    for (const entry of materialised.manga) {
+      const rendered = await renderSyntheticCover({ slug: entry.slug });
+      await storage.putStream(
+        asAssetKey(coverObjectPathFor({ slug: entry.slug, ext: 'webp' })),
+        bytesToStream(rendered.webp),
+        'image/webp',
+      );
+      await storage.putStream(
+        asAssetKey(coverObjectPathFor({ slug: entry.slug, ext: 'jpeg' })),
+        bytesToStream(rendered.jpeg),
+        'image/jpeg',
+      );
+      coversWritten += 1;
+    }
+    timings['covers'] = Date.now() - coverStartedAt;
+    log.info(
+      { covers: coversWritten, coverMs: timings['covers'] },
+      'Synthetic covers rendered and written to object storage (webp/jpeg per title).',
+    );
+
     const writeStartedAt = Date.now();
     const repositories = createSeedRepositories(db);
     const writes = await writeSeedPlan(materialised, repositories, {
@@ -1973,7 +1947,7 @@ export async function runSeed(options) {
     stdout(report);
     if (verification.unplannedTitles.length > 0 || verification.geometryMismatches.length > 0) {
       stderr(
-        `${SEED_TASK_ID}: the read-back found rows the plan does not account for; ` +
+        `seed: the read-back found rows the plan does not account for; ` +
           'see the anomalies line of the report.\n',
       );
       return { code: EXIT_FAILED, report, stats: writes, verification, timings };
@@ -1981,14 +1955,14 @@ export async function runSeed(options) {
     return { code: EXIT_OK, report, stats: writes, verification, timings };
   } catch (error) {
     if (error instanceof SeedRefusal) {
-      stderr(`${SEED_TASK_ID}: refused — ${error.message}\n`);
+      stderr(`seed: refused — ${error.message}\n`);
       return { code: EXIT_REFUSED, refusal: error, timings };
     }
     if (error instanceof MissingSchemaError) {
-      stderr(`${SEED_TASK_ID}: ${error.message}\n`);
+      stderr(`seed: ${error.message}\n`);
       return { code: EXIT_NO_SCHEMA, timings };
     }
-    stderr(`${SEED_TASK_ID}: failed — ${describe(error)}\n`);
+    stderr(`seed: failed — ${describe(error)}\n`);
     return { code: EXIT_FAILED, timings };
   } finally {
     if (db !== undefined) {
@@ -2000,8 +1974,6 @@ export async function runSeed(options) {
     }
   }
 }
-
-/* ── CLI entry point ─────────────────────────────────────────────────────── */
 
 /**
  * True when this module is the process entry point (`tsx scripts/seed.mjs`),

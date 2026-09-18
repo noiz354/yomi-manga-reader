@@ -1,37 +1,32 @@
 /**
  * The seed's page images are reachable by the route the reader actually calls.
  *
- * Why this file exists
- * --------------------
- * A seeded page row carried an `asset_key` and three recorded byte sizes, and the object
- * behind it did not exist — the seed encoded every variant and then dropped the bytes.
- * `/media/{key}.jpeg` answered 404 and the reader rendered a broken image. Every number in
- * the seed report was true and the product was still undeliverable, because no test
- * followed a seeded key all the way to a response.
+ * A seeded page row carried an `asset_key` and three recorded byte sizes, and
+ * the object behind it did not exist — the seed encoded every variant and then
+ * dropped the bytes, so `/media/{key}.jpeg` answered 404 and the reader
+ * rendered a broken image. Every number in the seed report was true and the
+ * product was still undeliverable, because no test followed a seeded key all
+ * the way to a response.
  *
  * Two independent faults had to be fixed, and either one alone leaves a 404:
  *
  * 1. The key. `DELIVERY_KEY_PATTERN` in src/server/media/page-delivery.ts is
- *    `/^([A-Za-z0-9_-]{22,64})\.(avif|webp|jpeg)$/` — one URL segment, no slashes. The
- *    seed minted `seed/v1/<32 hex>`, so `parseDeliveryKey` returned null and the route
- *    404'd before consulting storage at all.
+ *    `/^([A-Za-z0-9_-]{22,64})\.(avif|webp|jpeg)$/` — one URL segment, no
+ *    slashes. A `seed/v1/<32 hex>` key made `parseDeliveryKey` return null and
+ *    the route 404 before consulting storage at all.
  * 2. The path. The OBJECT lives at `pages/{chapterId}/{assetKey}.{ext}`, which
- *    `pageObjectKey` builds server-side. Writing the bare key produced an object in a
- *    directory no request would ever name.
+ *    `pageObjectKey` builds server-side. Writing the bare key produced an
+ *    object in a directory no request would ever name.
  *
- * So this suite runs the seed's own functions — not a reimplementation — and then asks
- * the delivery path for the key they produced. A change that breaks either half fails
- * here rather than in a reader's face.
- *
- * Requirements: FR-MEDIA-003, ADR-004, NFR-SEC-010, NFR-PERF-009.
- * Tasks: T-CATALOG-010 (delivery), T-FOUND-012 (the seed harness), T-UPLOAD-004
- *        (the pipeline that will eventually own this write).
+ * This suite runs the seed's own functions — not a reimplementation — and then
+ * asks the delivery path for the key they produced.
  *
  * DSN: `DATABASE_URL`; SKIPS without it. Throwaway database, own port.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import {
+  coverObjectKey,
   createObjectStorageAsync,
   pageObjectKey,
 } from '../../src/server/storage/object-storage';
@@ -42,6 +37,9 @@ import { chapter, chapterPage, manga, users } from '../../src/server/db/schema';
 import { and, eq } from 'drizzle-orm';
 import {
   chapterIdFor,
+  coverAssetKey,
+  coverObjectPathFor,
+  deterministicUuid,
   pageAssetKey,
   pageObjectPathFor,
 } from '../../scripts/seed.mjs';
@@ -56,7 +54,7 @@ const SLUG = 'seed-delivery-probe';
 const CHAPTER_NUMBER = '1.00';
 const NOW = new Date('2026-03-01T00:00:00.000Z');
 
-describeDb('a seeded page image is reachable through /media (INT-MEDIA-SEED)', () => {
+describeDb('a seeded page image is reachable through /media', () => {
   let open: OpenDatabase;
   let storage: Awaited<ReturnType<typeof createObjectStorageAsync>>;
   let deps: MediaDeliveryDeps;
@@ -167,9 +165,51 @@ describeDb('a seeded page image is reachable through /media (INT-MEDIA-SEED)', (
     expect(body.length).toBe(jpeg.length);
   });
 
+  it('serves a cover whose key the seed minted, from the path the seed wrote', async () => {
+    // The cover half of the same agreement the page test pins: the seed's
+    // own derivation, the product object-key builder, and the delivery route
+    // must all name the same bytes. The `seed/v1/cover/<digest>` key
+    // shape 404s at parse time; this is the regression that stays fixed.
+    const coverSlug = 'seed-delivery-probe-cover';
+    // The id the seed's own derivation produces for this slug — the same one
+    // `coverObjectPathFor` builds its object path from, so the agreement
+    // assertion below is an end-to-end check of the derivation chain.
+    const coverMangaId = deterministicUuid('manga', coverSlug);
+    const key = coverAssetKey({ slug: coverSlug });
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x11, 0x22, 0xff, 0xd9]);
+
+    await open.db.delete(manga).where(eq(manga.id, coverMangaId)).catch(() => undefined);
+    await open.db.insert(manga).values({
+      id: coverMangaId,
+      slug: coverSlug,
+      title: 'Seed Delivery Probe Cover',
+      status: 'ongoing',
+      readingDirection: 'ltr',
+      published: true,
+      coverAssetKey: key,
+    });
+
+    // Where the seed puts the object — the seed's OWN rule, not one this test
+    // rebuilds. Asserted equal to the product helper so a change to either
+    // one is visible, exactly like the page leg above.
+    const seedPath = coverObjectPathFor({ slug: coverSlug, ext: 'jpeg' });
+    expect(seedPath).toBe(coverObjectKey(coverMangaId, key, 'jpeg'));
+    await storage.putStream(seedPath as AssetKey, streamOf(jpeg), 'image/jpeg');
+
+    const response = await deliverPage(`${key}.jpeg`, deps);
+    const body = Buffer.from(await response.arrayBuffer());
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/jpeg');
+    expect(body.subarray(0, 3).toString('hex')).toBe('ffd8ff');
+    expect(body.subarray(-2).toString('hex')).toBe('ffd9');
+
+    await open.db.delete(manga).where(eq(manga.id, coverMangaId));
+  });
+
   it('404s a key the delivery grammar rejects, without touching storage', async () => {
-    // The old seed prefix, kept as the regression this file exists for. A slash in the
-    // key is a single path segment too many, so the request cannot name an object.
+    // The seed prefix, kept as the regression this file exists for. A slash in the
+    // key is one path segment too many, so the request cannot name an object.
     const slashed = `${randomBytes(16).toString('hex')}/nope`;
     const response = await deliverPage(`${slashed}.jpeg`, deps);
 
@@ -177,7 +217,7 @@ describeDb('a seeded page image is reachable through /media (INT-MEDIA-SEED)', (
   });
 
   it('leaves a page with no object behind as a 404, which is what the reader reports', async () => {
-    // A row with no object: the state the reader now renders honestly instead of a
+    // A row with no object: the state the reader renders honestly instead of a
     // broken image. Asserted so the two stay in agreement.
     const missing = pageAssetKey({ slug: SLUG, chapterNumber: CHAPTER_NUMBER, pageNumber: 7 });
     await open.db.insert(chapterPage).values({

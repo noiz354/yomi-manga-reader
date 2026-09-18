@@ -1,41 +1,23 @@
 /**
- * Integration tests — the dev seed harness against a REAL PostgreSQL 18
- * (T-FOUND-012).
+ * Integration tests — the dev seed harness against a REAL PostgreSQL 18.
  *
- * What is asserted here, and why it is an integration test:
- *   the rows are actually in the database with the counts the
- *                 report claims; the 30-page and 500-page chapters have exactly
- *                 30/500 contiguous pages at the fixture geometry with REAL
- *                 measured variant byte sizes; the seeded accounts are an
- *                 Argon2id admin and a reader; no title is anything but a
- *                 numbered fixture; the whole
- *                 500-page case stays inside the task's 60 s budget.
- *   a second run writes NOTHING and leaves the row counts, the
- *                 stored credential and the report byte-identical.
- *   the CLI refuses `NODE_ENV=production` with exit code 2 even
- *                 though `--env dev` was passed (the security control, observed
- *                 through a real process rather than a function call).
+ * The rows land with the counts the report claims; the page fixtures are
+ * contiguous at the harness's default 480x720 geometry with real encoded byte
+ * sizes; a second run writes nothing (byte-identical report, untouched
+ * credential); and the CLI refuses `NODE_ENV=production` with exit code 2. The
+ * 60 s page budget is a claim about that geometry, so shrinking the images
+ * would assert nothing.
  *
- * The page fixtures are rendered at the harness's DEFAULT geometry (480x720)
- * here on purpose: the 60 s budget is a claim about that geometry, so a test
- * that shrank the images would assert nothing. The 500-page chapter dominates
- * this file's runtime (~20 s per run, twice) — that is the cost of the
- * product's defining performance case being a real fixture.
- *
- * DSN: `DATABASE_URL`, the variable DEPLOYMENT.md §3 declares. The suite SKIPS
- * (never silently passes) when it is absent, so `npm run test:unit` and a bare
- * `npm test` work without Docker. `beforeAll` drops and recreates the `public`
- * schema, so the DSN MUST point at a THROWAWAY database:
- *
+ * DSN: `DATABASE_URL`. SKIPS (never silently passes) when absent.
+ * `beforeAll` drops and recreates `public`, so the DSN MUST point at a
+ * THROWAWAY database:
  *   docker run -d --name yomi-seed-tmp -e POSTGRES_USER=yomi \
  *     -e POSTGRES_PASSWORD=yomi -e POSTGRES_DB=yomi -p 55439:5432 postgres:18-alpine
  *   DATABASE_URL=postgres://yomi:yomi@127.0.0.1:55439/yomi \
  *     npx vitest run tests/integration/seed.harness.test.ts
  *
- * Note (`vitest.config.ts` runs integration files in ONE fork): do not point
- * this suite at the same database as `db-schema.test.ts`, which also drops the
- * schema. Nothing in this file uses product data; every row comes from the
- * harness itself.
+ * `vitest.config.ts` runs integration files in ONE fork: do not point this suite
+ * at the same database as `db-schema.test.ts`, which also drops the schema.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -52,8 +34,6 @@ import {
   runSeed,
 } from '../../scripts/seed.mjs';
 
-/* ── the environment the harness is given ────────────────────────────────── */
-
 const DATABASE_URL = process.env['DATABASE_URL'];
 const describeDb = DATABASE_URL ? describe : describe.skip;
 
@@ -61,9 +41,9 @@ const describeDb = DATABASE_URL ? describe : describe.skip;
 const SENTINEL_CREDENTIAL = 'it-never-happened-7c1f4a92';
 
 /**
- * A complete, valid DEPLOYMENT.md §3 environment for a throwaway database. The
- * credential is generated here at test time, which is the point: the harness
- * cannot be given a password that is not in the environment (UNIT-SEED-003).
+ * A complete, valid environment for a throwaway database. The credential is
+ * generated here at test time, which is the point: the harness cannot be given
+ * a password that is not in the environment.
  */
 /** Where this suite's page objects land. Per-run, so a stale tree cannot mask a missing write. */
 const SEED_TEST_STORAGE_DIR = join(tmpdir(), `yomi-seed-harness-${process.pid}`);
@@ -82,11 +62,11 @@ function harnessEnv(overrides: Record<string, string | undefined> = {}): Record<
     S3_BUCKET: 'yomi-media',
     S3_ACCESS_KEY_ID: 'yomi-access-key',
     S3_SECRET_ACCESS_KEY: 'yomi-secret-key',
-    // The seed now writes each page's three variants through `ObjectStoragePort`
-    // (T-UPLOAD-004 is what will own that step for real uploads). Pointed at a local
-    // directory so the suite exercises the write against a storage that exists; the S3
-    // endpoint above stays a dead port precisely so a test that reached for it would fail
-    // rather than silently talk to a shared bucket.
+    // The seed writes each page's three variants through `ObjectStoragePort`.
+    // Pointed at a local directory so the suite exercises the write against a
+    // storage that exists; the S3 endpoint above stays a dead port precisely so a
+    // test that reached for it would fail rather than silently talk to a shared
+    // bucket.
     STORAGE_DIR: SEED_TEST_STORAGE_DIR,
     NEXT_TELEMETRY_DISABLED: '1',
     SEED_ADMIN_PASSWORD: SENTINEL_CREDENTIAL,
@@ -111,9 +91,7 @@ function capture() {
   };
 }
 
-/* ── INT-SEED-001/002 — the seed against a real database ────────────────── */
-
-describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run is a no-op', () => {
+describeDb('seed → assert counts → re-run is a no-op', () => {
   let sql: ReturnType<typeof postgres>;
   /** The report of the first run, kept for the determinism/idempotency checks. */
   let firstReport = '';
@@ -148,7 +126,7 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
       firstReport = result.report ?? '';
       firstTimings = result.timings;
 
-      // ── the report's own totals, line by line ──────────────────────────
+      // the report's own totals, line by line
       expect(firstReport).toContain(
         'totals manga=10 chapters=26 pages=722 users=2 genres=8 tags=8 creators=2',
       );
@@ -158,7 +136,7 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
       expect(firstReport).toContain('anomalies unplanned_titles=0 geometry_mismatches=0');
       expect(firstReport).toContain('pages=480x720 synthetic=gradient-grayscale');
 
-      // ── and the database agrees with the report ────────────────────────
+      // and the database agrees with the report
       const counts = await sql<{ table_name: string; n: number }[]>`
         select 'users' as table_name, count(*)::int as n from users
         union all select 'genre', count(*)::int from genre
@@ -218,14 +196,14 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
       >`select page_number, asset_key, width, height, byte_size_avif, byte_size_webp, byte_size_jpeg
         from chapter_page where chapter_id = ${chapterId}::uuid order by page_number`;
       expect(pages.length, slug).toBe(expected);
-      // DATA_MODEL §21.2: exactly 1..N, no gaps, no duplicates
+      // exactly 1..N, no gaps, no duplicates
       expect(pages.map((page) => page.page_number)).toEqual(
         Array.from({ length: expected }, (_, offset) => offset + 1),
       );
       for (const page of pages) {
         // An opaque handle that the delivery grammar accepts: one URL segment, 22–64
-        // chars of [A-Za-z0-9_-], no slashes. The old `seed/v1/<digest>` keys failed
-        // this and 404'd at parse time — see tests/integration/media-seed-delivery.test.ts.
+        // chars of [A-Za-z0-9_-], no slashes. `seed/v1/<digest>` keys fail this and
+        // 404 at parse time — see tests/integration/media-seed-delivery.test.ts.
         expect(page.asset_key, slug).toMatch(/^[0-9a-f]{32}$/);
         expect(page.width).toBe(480);
         expect(page.height).toBe(720);
@@ -284,7 +262,7 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
     for (const row of creators) expect(row.name).toMatch(/^tvitest-Seed (Author|Artist) 01$/);
   });
 
-  it('leaves a draft chapter unpublished (FR-CHAPTER-002 has a fixture)', async () => {
+  it('leaves a draft chapter unpublished (has a fixture)', async () => {
     const rows = await sql<{ status: string; n: number }[]>`
       select status, count(*)::int as n from chapter group by status order by status
     `;
@@ -327,7 +305,7 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
       // Everything the report says about the DATABASE is byte-identical to the
       // first run's. The one line that must differ is the write counter line —
       // that difference is the idempotency evidence, not a determinism failure
-      // (a diff between two FRESH runs is empty; see the T-FOUND-012 report).
+      // (a diff between two FRESH runs is empty).
       expect(stripWriteLine(result.report ?? '')).toBe(stripWriteLine(firstReport));
       expect(result.report).not.toBe(firstReport);
       // the database is untouched, down to the Argon2id salt
@@ -343,9 +321,8 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
   it('refuses a production run through the CLI, with exit code 2', () => {
     // The security control, observed through a real process: a `--env dev` flag
     // behind `NODE_ENV=production` must not reach the database. The environment
-    // below is a COMPLETE, VALID production configuration (https everywhere, as
-    // T-FOUND-002 requires) so that the refusal cannot be dismissed as "it just
-    // failed to boot".
+    // below is a COMPLETE, VALID production configuration (https everywhere) so
+    // that the refusal cannot be dismissed as "it just failed to boot".
     const script = fileURLToPath(new URL('../../scripts/seed.mjs', import.meta.url));
     const env = {
       ...process.env,
@@ -371,13 +348,11 @@ describeDb('INT-SEED-001/002 / T-FOUND-012 — seed → assert counts → re-run
     expect(exitCode).toBe(EXIT_REFUSED);
     expect(output).toContain('refused');
     expect(output).toContain('NODE_ENV=production');
-    // redaction: the refusal names the variable, never the DSN (NFR-OBS-006)
+    // redaction: the refusal names the variable, never the DSN
     expect(output).not.toContain(DATABASE_URL as string);
     expect(output).not.toContain(SENTINEL_CREDENTIAL);
   });
 });
-
-/* ── helpers ─────────────────────────────────────────────────────────────── */
 
 /**
  * Narrows a possibly-absent row value so it can be bound as a parameter (a
@@ -435,10 +410,12 @@ const HARNESS_SOURCE = readFileSync(
 
 describe('the harness documents its own phase', () => {
   it('says in its header that keys and bytes are seeded but the pipeline is not done', () => {
-    // The header must say that covers are still dark: page bytes are real,
-    // cover bytes are not. The test pins the wording so the caveat cannot
-    // drift away silently.
-    expect(HARNESS_SOURCE).toContain('covers 404 until the cover half of the pipeline lands');
+    // A future reader must not take the seeded keys as proof that the media
+    // pipeline is done: the seed writes delivery-valid keys AND bytes, but
+    // pipeline-minted keys and GC have not run. The header says both, and the
+    // test pins the wording so the caveat cannot drift away silently.
+    expect(HARNESS_SOURCE).toContain('Phase two: keys are delivery-valid AND bytes are written');
+    expect(HARNESS_SOURCE).toContain('A seeded catalog is not proof that upload ingest works');
   });
 
     it('writes page objects through the storage port and never touches the filesystem itself', () => {
