@@ -1,0 +1,726 @@
+# CI: PRs run the fast gates (typecheck, lint, boundaries, unit, build,
+# contracts); main and tags additionally run integration, E2E, security and the
+# bundle budget. One gate per step, so a red light names its gate.
+#
+# `npm ci` only (the lockfile is the install contract); Node 24 comes from
+# `.nvmrc`; service images and actions are pinned; no secret is written to this
+# file and none is echoed by any step. The throwaway session secret in the E2E
+# job is generated per run and never committed.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# Least privilege: nothing in this pipeline writes to the repository
+# (no mutation surface is created by CI).
+permissions:
+  contents: read
+
+# A new push to a PR supersedes the previous run; a main/tag run is never
+# cancelled, because its gates (E2E, integration) are the release evidence.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # PostgreSQL 18, pinned. `postgres:18-alpine` currently resolves to 18.6
+  # (verified: `docker exec <c> postgres --version` → "postgres (PostgreSQL)
+  # 18.6" on 2026-09-27).
+  PG_IMAGE: postgres:18-alpine
+  # The S3 slot of the integration environment. See the "S3 leg" note in the
+  # integration job: this is the same image docker-compose.dev.yml pins, and the
+  # two must be changed together. Override with the repository variable
+  # S3_IMAGE.
+  # digest of rustfs/rustfs:1.0.0 as pulled 2026-09-27:
+  #   sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+  S3_IMAGE: ${{ vars.S3_IMAGE || 'rustfs/rustfs:1.0.0' }}
+  # gitleaks is fetched as a pinned binary with a pinned checksum rather than
+  # through a marketplace action: it needs no token, no licence gate, and the
+  # checksum is verifiable by anyone reading this file.
+  GITLEAKS_VERSION: v8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  # E2E_PORT is what playwright.config.ts reads for both the base URL and the
+  # `webServer` port; keeping it in one place keeps the two in step.
+  E2E_PORT: '3100'
+
+jobs:
+  quality:
+    name: quality (typecheck · lint · boundaries · unit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          # npm cache: keyed on the lockfile, restored by setup-node itself.
+          # ~310 packages, a 40 s cold install.
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # `npm run lint` is `eslint .`, and the D1–D9 boundary rules are rules in
+      # that config (eslint.config.mjs), so this step is the boundary gate for
+      # a real violation in src/**.
+      - name: Lint (includes the D1–D9 boundary rules)
+        run: npm run lint
+
+      # The self-test proves each rule is enforced, in the failing direction:
+      # it writes one forbidden import per rule and asserts ESLint rejects it
+      # with that rule's own message. A rule that silently stopped matching
+      # fails here (exit 1) instead of quietly passing CI forever.
+      - name: Boundary rules — each rule proven to catch its own violation
+        run: npm run lint:boundaries
+
+      - name: Unit
+        run: npm run test:unit
+
+  contracts:
+    name: contracts (token contrast)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # Every colour token must be covered by a measured contrast pair in both
+      # themes.
+      - name: Token contrast, light and dark
+        run: node scripts/check-token-contrast.mjs
+
+  build:
+    name: build (next build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # `next build` is the gate that catches RSC/client boundary mistakes the
+      # unit layer cannot. Its output is the artifact the E2E and bundle-budget
+      # jobs consume, so it is built exactly once.
+      - name: next build
+        run: npm run build
+
+      - name: Upload the build for the e2e + bundle-budget jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-build-${{ github.sha }}
+          path: .next
+          # upload-artifact v4 skips dotfiles without this; `.next` is full of
+          # them (cache/, required-server-files.json is not, but .next/server
+          # layout is).
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  integration:
+    name: integration (PostgreSQL 18.6 · S3)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PG_CONTAINER: yomi-ci-pg
+      S3_CONTAINER: yomi-ci-s3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # The pulled layer set of the pinned service images is cached, keyed on
+      # the image references themselves: bumping a tag invalidates the entry,
+      # and a hit can never serve a different image than the one the job asked
+      # for. When the image is built rather than pulled, this becomes
+      # `docker/build-push-action` with cache-from/cache-to: type=gha.
+      - name: Cache service image layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/yomi-images
+          key: docker-layers-${{ runner.os }}-${{ env.PG_IMAGE }}-${{ env.S3_IMAGE }}
+
+      - name: Load or fetch the service images
+        run: |
+          set -euo pipefail
+          if [ -f /tmp/yomi-images/images.tar ]; then
+            echo 'cache hit — loading the image layers saved by an earlier run'
+            docker load --input /tmp/yomi-images/images.tar
+          else
+            images=("$PG_IMAGE" "$S3_IMAGE")
+            for image in "${images[@]}"; do
+              echo "cache miss — pulling $image"
+              docker pull "$image"
+            done
+            mkdir -p /tmp/yomi-images
+            docker save --output /tmp/yomi-images/images.tar "${images[@]}"
+          fi
+          docker images
+
+      # Ephemeral ports: `-p 127.0.0.1::5432` lets docker pick a free host
+      # port, so a busy 5432 on the runner cannot fail the job, and two jobs on
+      # the same runner can never collide. The port is read back from
+      # `docker port` and never assumed.
+      - name: Start PostgreSQL
+        id: pg
+        run: |
+          set -euo pipefail
+          docker run --detach --name "$PG_CONTAINER" \
+            --env POSTGRES_USER=yomi \
+            --env POSTGRES_PASSWORD=yomi \
+            --env POSTGRES_DB=yomi \
+            --publish 127.0.0.1::5432 \
+            "$PG_IMAGE"
+          port="$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | sed 's/.*://')"
+          for _ in $(seq 1 60); do
+            if docker exec "$PG_CONTAINER" pg_isready --username yomi --quiet; then
+              break
+            fi
+            sleep 1
+          done
+          # Non-zero exit if it never became ready: an unready database must
+          # fail here, not surface later as a confusing migration error.
+          docker exec "$PG_CONTAINER" pg_isready --username yomi
+          dsn="postgres://yomi:yomi@127.0.0.1:${port}/yomi"
+          echo "dsn=$dsn" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Integration service'
+            echo
+            echo "- PostgreSQL image: \`$PG_IMAGE\` on 127.0.0.1:$port (ephemeral port)"
+            echo "- S3 image: \`$S3_IMAGE\` (the MinIO slot; see the S3 leg note below)"
+            echo '- Credentials: throwaway, created for this job, never committed'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # MinIO is no longer obtainable. Measured 2026-09-27 from this
+      # repository's own workstation, not assumed:
+      #   * `minio/minio` on Docker Hub → the repository returns 404. MinIO
+      #     deleted it on 2026-09-11; `minio/mc` is gone the same way.
+      #   * `quay.io/minio/minio` → the repository page resolves (HTTP 200) but
+      #     an anonymous manifest HEAD returns 401 Unauthorized. Other quay.io
+      #     repositories answer 200 from the same network, so the gate is
+      #     MinIO's, not the network's.
+      # The substitution keeps the spec's shape (port 9000, S3_ENDPOINT a bare
+      # http URL, a bucket called yomi-media) and the implementation is RustFS
+      # 1.0.0 — S3-compatible, `mc`-compatible. This job uses the same image
+      # and the same env names as docker-compose.dev.yml so that CI and dev
+      # exercise one server, not two. A pre-prod protocol-equivalence check
+      # must name RustFS explicitly; that is a spec fix, not a silent edit.
+      #
+      # Readiness is the S3 API answering, not a TCP probe: the image ships no
+      # shell and no curl, and an open port proves nothing about S3. Any HTTP
+      # status counts — an unsigned request to an S3 endpoint is answered 403,
+      # which is the API being alive.
+      - name: Start the S3 service
+        id: s3
+        run: |
+          set -euo pipefail
+          docker run --detach --name "$S3_CONTAINER" \
+            --env RUSTFS_VOLUMES=/data \
+            --env RUSTFS_ADDRESS=0.0.0.0:9000 \
+            --env RUSTFS_CONSOLE_ENABLE=true \
+            --env RUSTFS_ACCESS_KEY=yomi-ci-access-key \
+            --env RUSTFS_SECRET_KEY=yomi-ci-secret-key-0001 \
+            --publish 127.0.0.1::9000 \
+            "$S3_IMAGE" server /data
+          port="$(docker port "$S3_CONTAINER" 9000/tcp | head -1 | sed 's/.*://')"
+          for _ in $(seq 1 60); do
+            if curl --silent --output /dev/null --write-out '' "http://127.0.0.1:${port}/"; then
+              echo "S3 answering on 127.0.0.1:$port"
+              echo "endpoint=http://127.0.0.1:${port}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo '::error title=The S3 service never answered::an S3-compatible server must answer even an unsigned request'
+          docker logs "$S3_CONTAINER" || true
+          exit 1
+
+      # Migrations run before serving. The integration suite also re-runs them
+      # from an empty schema in its own beforeAll, so this step proves the
+      # documented operator path and the test proves the lifecycle.
+      - name: db:migrate
+        env:
+          DATABASE_URL: ${{ steps.pg.outputs.dsn }}
+          MIGRATION_DATABASE_URL: ${{ steps.pg.outputs.dsn }}
+        run: npm run db:migrate
+
+      - name: Integration (vitest run tests/integration)
+        env:
+          DATABASE_URL: ${{ steps.pg.outputs.dsn }}
+          S3_ENDPOINT: ${{ steps.s3.outputs.endpoint }}
+          S3_REGION: us-east-1
+          S3_BUCKET: yomi-media
+          S3_ACCESS_KEY_ID: yomi-ci-access-key
+          S3_SECRET_ACCESS_KEY: yomi-ci-secret-key-0001
+        run: npm run test:integration
+
+      # A failed integration run must not leave the reason inside a container
+      # that dies with the runner.
+      - name: Service logs (on failure)
+        if: failure()
+        run: |
+          echo '--- postgres ---'
+          docker logs "$PG_CONTAINER" || true
+          echo '--- s3 ---'
+          docker logs "$S3_CONTAINER" || true
+
+  e2e:
+    name: e2e (playwright · axe gate)
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # Playwright browser cache. Chromium is ~170 MB; without this every run
+      # pays the download. `--with-deps` still runs on a cache hit because the
+      # apt-level libraries are not part of the cached directory, and
+      # `playwright install` is a no-op for a browser that is already there.
+      - name: Cache the Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+
+      - name: Install Chromium (browsers + OS dependencies)
+        run: npx playwright install --with-deps chromium
+
+      - name: Download the build produced by the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: next-build-${{ github.sha }}
+          path: .next
+
+      # The route map under test is seeded rather than shell-only. The seed
+      # harness refuses to migrate (the app role is DML-only), refuses to run
+      # without its credentials, and refuses to write a page whose bytes it
+      # cannot produce — so this job has to provide a real migrated database,
+      # in the same order a developer does: migrate, then seed.
+      #
+      # Both credentials are per-run throwaways written to $GITHUB_ENV, never
+      # committed and never printed. The seed harness reads them from the same
+      # source object as the app config, which is why they must be exported
+      # before the step runs rather than passed as arguments.
+      - name: Start PostgreSQL for the seed
+        id: pg
+        run: |
+          set -euo pipefail
+          docker run --detach --name yomi-e2e-pg \
+            --env POSTGRES_USER=yomi --env POSTGRES_PASSWORD=yomi \
+            --env POSTGRES_DB=yomi --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --publish 127.0.0.1::5432 "$PG_IMAGE"
+          port="$(docker port yomi-e2e-pg 5432/tcp | head -1 | sed 's/.*://')"
+          for _ in $(seq 1 60); do
+            if docker exec yomi-e2e-pg pg_isready -U yomi -d yomi >/dev/null 2>&1; then
+              echo "dsn=postgres://yomi:yomi@127.0.0.1:${port}/yomi" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo '::error title=PostgreSQL never became ready::pg_isready did not pass within 60s'
+          docker logs yomi-e2e-pg || true
+          exit 1
+
+      - name: db:migrate (the seed's prerequisite)
+        env:
+          DATABASE_URL: ${{ steps.pg.outputs.dsn }}
+          MIGRATION_DATABASE_URL: ${{ steps.pg.outputs.dsn }}
+        run: npm run db:migrate
+
+      # The app under test. Every value here is a throwaway for a process that
+      # lives inside one job: there is no production database, no production
+      # object store and no real secret here, and none of these values is ever
+      # printed. SESSION_SECRET is generated per run precisely so that no
+      # credential-shaped string is committed to this file.
+      # The S3 endpoint keeps an unreachable host on purpose: this job runs no
+      # object store, so STORAGE_DIR points the seed AND the app server at the
+      # same local root (the seed writes real page/cover bytes; the driver is
+      # filesystem wherever STORAGE_DIR is set). SEED_EMAIL_PREFIX is the seed's
+      # test-mode key prefix for this invocation (`--env test` with no --run-id
+      # seeds run-id `local`, i.e. prefix `tlocal-`) — the sign-in spec needs
+      # the exact reader address the seed wrote.
+      - name: Test environment
+        run: |
+          {
+            echo "NEXT_TELEMETRY_DISABLED=1"
+            echo "APP_ORIGIN=http://127.0.0.1:${E2E_PORT}"
+            echo "SESSION_SECRET=$(openssl rand -hex 32)"
+            echo "DATABASE_URL=${{ steps.pg.outputs.dsn }}"
+            echo 'S3_ENDPOINT=http://127.0.0.1:9000'
+            echo 'S3_REGION=us-east-1'
+            echo 'S3_BUCKET=yomi-media'
+            echo 'S3_ACCESS_KEY_ID=yomi'
+            echo 'S3_SECRET_ACCESS_KEY=yomi-ci-only'
+            echo "STORAGE_DIR=${RUNNER_TEMP}/yomi-e2e-storage"
+            echo "SEED_ADMIN_PASSWORD=$(openssl rand -hex 16)"
+            echo "SEED_READER_PASSWORD=$(openssl rand -hex 16)"
+            echo 'SEED_EMAIL_PREFIX=tlocal-'
+          } >> "$GITHUB_ENV"
+
+      # E2E seeds through the dev seed harness and nothing else. The detect
+      # step is kept rather than the call being made unconditional, so a future
+      # change that removes the harness fails loudly here instead of silently
+      # running unseeded.
+      - name: Detect the seed harness
+        id: seed
+        run: |
+          if [ -f scripts/seed.mjs ]; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+            {
+              echo '> [!WARNING]'
+              echo '> E2E ran **unseeded**: `scripts/seed.mjs` does not exist yet'
+              echo '> The route map is exercised without fixtures.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::warning title=E2E ran unseeded::scripts/seed.mjs does not exist yet; the route map is exercised without fixtures.'
+          fi
+
+      - name: Seed
+        if: steps.seed.outputs.present == 'true'
+        run: npm run seed -- --env test
+
+      # playwright.config.ts owns the app lifecycle: in CI it starts
+      # `npm run start -- --port 3100` and waits for the base URL.
+      - name: Playwright E2E
+        run: npm run test:e2e
+
+      - name: Upload the Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.sha }}
+          path: |
+            playwright-report
+            test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # The a11y gate: "@axe-core/playwright on every E2E route … zero
+      # violations (any severity)", every CI run. It runs as its own step
+      # because playwright.config.ts's webServer is torn down when the
+      # Playwright run ends, and it drives its own instance of the same build.
+      - name: Start the app for the a11y gate
+        run: |
+          nohup npm run start -- --port "$E2E_PORT" > "$RUNNER_TEMP/yomi-a11y-server.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/yomi-a11y-server.pid"
+
+      - name: Wait for /healthz
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl --silent --fail --output /dev/null "http://127.0.0.1:${E2E_PORT}/healthz"; then
+              echo "app ready on 127.0.0.1:${E2E_PORT}"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo '::error title=The app never answered /healthz::see the log below'
+          cat "$RUNNER_TEMP/yomi-a11y-server.log"
+          exit 1
+
+      - name: a11y gate — axe-core on every E2E route
+        env:
+          AXE_BASE_URL: http://127.0.0.1:${{ env.E2E_PORT }}
+        run: |
+          node --input-type=module <<'AXE_GATE'
+          // The axe-core gate. Kept inline and dependency-free on purpose: it
+          // reads only the two devDependencies it needs (@playwright/test for
+          // the browser, @axe-core/playwright for the rules), so it cannot
+          // drift out of step with the E2E browser the rest of the job uses.
+          //
+          // FAIL CONTRACT: zero violations, at ANY severity, on every route in
+          // the E2E map. The rule set is the WCAG 2.1 AA + 2.2 AA tags, and
+          // there is deliberately no `.withTags(['wcag2aa'])` severity
+          // carve-out and no allowlist of known findings: a known violation is
+          // a failing test, not a backlog item.
+          //
+          // `/no-such-page` returns 404 BY DESIGN (an error state is a page
+          // that must be announced, focusable, and offer a next action), so a
+          // non-2xx status is reported, not failed on.
+          import { AxeBuilder } from '@axe-core/playwright';
+          import { chromium } from '@playwright/test';
+
+          const baseUrl = process.env.AXE_BASE_URL ?? 'http://127.0.0.1:3100';
+          const routes = (
+            process.env.AXE_ROUTES ??
+            [
+              '/',
+              '/discover',
+              '/search',
+              '/library',
+              '/history',
+              '/bookmarks',
+              '/settings',
+              '/auth/signin',
+              '/auth/register',
+              '/manga/some-slug',
+              '/manga/some-slug/chapter/1',
+              '/admin',
+              '/admin/manga',
+              '/admin/manga/1',
+              '/admin/manga/1/chapters',
+              '/admin/uploads',
+              '/admin/users',
+              '/admin/audit',
+              '/no-such-page',
+            ].join(',')
+          ).split(',');
+
+          const tags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
+          const browser = await chromium.launch();
+          const rows = [];
+          let violations = 0;
+
+          for (const route of routes) {
+            // A BrowserContext per route, not `browser.newPage()`: axe-core
+            // needs the context to install its bindings and source, and
+            // @axe-core/playwright refuses a page created straight off the
+            // browser ("Please use browser.newContext()").
+            const context = await browser.newContext();
+            const page = await context.newPage();
+            try {
+              const response = await page.goto(new URL(route, baseUrl).href, {
+                waitUntil: 'networkidle',
+              });
+              // `analyze()` resolves to the axe-core AxeResults object itself
+              // (@axe-core/playwright 4.x), so `results.violations` — not
+              // `{ results }.violations`.
+              const results = await new AxeBuilder({ page }).withTags(tags).analyze();
+              for (const violation of results.violations) {
+                violations += violation.nodes.length;
+                rows.push(
+                  `::error file=${route},title=${violation.impact ?? 'unknown'}::${violation.id} — ` +
+                    `${violation.help} (${violation.nodes.length} node(s), first: ` +
+                    `${violation.nodes[0]?.target?.join(' ')})`,
+                );
+              }
+              console.log(
+                `  ${String(results.violations.length).padStart(2)} violation(s)  ` +
+                  `HTTP ${response?.status() ?? '???'}  ${route}`,
+              );
+            } catch (error) {
+              violations += 1;
+              rows.push(`::error file=${route},title=gate-error::${String(error)}`);
+              console.log(`  !!  the gate itself failed on ${route}: ${String(error)}`);
+            } finally {
+              await context.close();
+            }
+          }
+
+          await browser.close();
+          console.log(rows.join('\n'));
+          {
+            const summary = [
+              '### a11y gate (axe-core)',
+              '',
+              `- routes checked: ${routes.length}`,
+              `- violations: **${violations}** (any severity fails)`,
+            ].join('\n');
+            await import('node:fs').then((fs) =>
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY ?? '/dev/null', summary),
+            );
+          }
+          if (violations > 0) {
+            console.error(`\na11y gate FAILED: ${violations} axe violation(s)`);
+            process.exit(1);
+          }
+          console.log(`\na11y gate passed: ${routes.length} routes, 0 violations`);
+          AXE_GATE
+
+      - name: Stop the a11y-gate server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/yomi-a11y-server.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/yomi-a11y-server.pid")" 2>/dev/null || true
+          fi
+          if [ -f "$RUNNER_TEMP/yomi-a11y-server.log" ]; then
+            cat "$RUNNER_TEMP/yomi-a11y-server.log"
+          fi
+
+  security:
+    name: security (gitleaks · npm audit)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Full history: the gate is about what is IN the repository, and a secret
+      # removed in a later commit is still in the history.
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # AUDIT LEVEL, DOCUMENTED:
+      #   * `npm audit --audit-level=high` is BLOCKING. `high` and `critical`
+      #     fail the job; `low` and `moderate` are reported by npm and do not.
+      #     The 12 moderate advisories npm reported against this tree on
+      #     2026-09-27 (all transitively via @opentelemetry/core <2.8.0 and
+      #     esbuild <=0.24.2 under drizzle-kit, both `fix` requiring a breaking
+      #     major) are printed by the step on every run, so the level can never
+      #     quietly become wrong: a new `high` is red, and a new `moderate`
+      #     still shows its name in the log.
+      #   * gitleaks runs with the default rule set and exactly one allowlist,
+      #     written down in the config below with its reason. The allowlist is
+      #     scoped by PATH, not by rule, and that is the honest statement of what
+      #     it costs: a real secret committed under tests/ would NOT be caught
+      #     here. It is accepted because fixtures live only under tests/ and are
+      #     synthetic by rule, the two known findings are synthetic
+      #     SESSION_SECRET literals in tests/unit/logger.test.ts (lines 47 and
+      #     254) whose entire purpose is to prove the logger redacts them, and a
+      #     real credential in a test file is a review failure this gate's path
+      #     scope would not catch. If that trade-off ever stops being
+      #     acceptable, replace the path with a fingerprint list.
+      #   * `--redact` is always on: a finding is reported by rule, file, line
+      #     and fingerprint, never by printing the matched string, so a real
+      #     secret can never be echoed into a job log.
+      - name: Fetch gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --silent --show-error --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: gitleaks (full history, redacted)
+        env:
+          GITLEAKS_CONFIG_TOML: |
+            [extend]
+            useDefault = true
+
+            [[allowlists]]
+            description = "fixtures live only under tests/ and are synthetic by rule. The two known findings are the synthetic SESSION_SECRET literals in tests/unit/logger.test.ts (lines 47 and 254), whose purpose is to prove the logger redacts them."
+            paths = ['''(^|/)tests/''']
+        run: |
+          set -euo pipefail
+          gitleaks git --redact --no-banner --no-color \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" .
+          echo 'gitleaks found no secret in the repository history.'
+
+      - name: gitleaks report (on failure)
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/gitleaks.json" ]; then
+            cat "$RUNNER_TEMP/gitleaks.json"
+            echo '::error title=Secret found in history::see the report above (rule, file, line, fingerprint); the value itself is never printed'
+          fi
+
+      - name: npm audit (blocking at high)
+        run: npm audit --audit-level=high
+
+  bundle-budget:
+    name: bundle budget
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24 + npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Download the build produced by the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: next-build-${{ github.sha }}
+          path: .next
+
+      # The hook exists (package.json `perf:bundle`) and this job is where the
+      # measuring script plugs in. Until the file exists the job announces that
+      # the budget is NOT being enforced; it does not report a pass, and it does
+      # not skip silently. Once scripts/check-bundle-budget.mjs lands, the first
+      # step below runs and this step disappears — no other edit is needed.
+      - name: Detect the budget script
+        id: budget
+        run: |
+          if [ -f scripts/check-bundle-budget.mjs ]; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+            {
+              echo '> [!WARNING]'
+              echo '> The bundle budget: initial reader JS ≤ 250 KB'
+              echo '> gzipped is NOT enforced: scripts/check-bundle-budget.mjs does'
+              echo '> not exist yet.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::warning title=Bundle budget not enforced::scripts/check-bundle-budget.mjs does not exist; a bundle overflow would not fail CI today.'
+          fi
+
+      - name: perf:bundle
+        if: steps.budget.outputs.present == 'true'
+        run: npm run perf:bundle
