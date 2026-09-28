@@ -1,0 +1,274 @@
+# Yomi — local dev environment.
+#
+# Every credential in this file is development-only. `yomi_dev` /
+# `yomi_dev_password`, the S3 access key, and the 64-hex SESSION_SECRET below
+# are throwaway literals committed on purpose, so the dev stack works from a
+# clone with zero setup. They are:
+#   - Not production values. Never copy any of them into prod, staging, CI
+#     secrets, a screenshot, or a bug report.
+#   - Reachable from anywhere that can reach the published dev ports, so the
+#     ports default to 127.0.0.1 (see the port-collision block below).
+#   - Written in `${VAR:-dev-default}` form on purpose: the literal is only a
+#     DEFAULT, and a developer or CI can replace it from the environment or a
+#     local `.env` (which .gitignore already excludes) without editing a
+#     tracked file. This is the same convention as `.env.example` /
+#     `.env.prod.example` — placeholders in the repo, values on the host.
+# Production secrets come from the host env file outside the repo or a CI
+# secret store.
+#
+# FINDING: the "MinIO" service is NOT MinIO (documented substitution).
+# The deployment docs name MinIO for the dev storage slot. MinIO is no longer
+# obtainable, measured 2026-09-27 on this host:
+#   - github.com/minio/minio is archived (owner archived it 2026-04-25).
+#   - `minio/minio` on Docker Hub: `pull access denied … repository does not
+#     exist`. `minio/mc` likewise.
+#   - `quay.io/minio/minio` and `quay.io/minio/mc`: HTTP 401 UNAUTHORIZED.
+# So the compose keeps the spec's shape (a service named `minio` on port 9000,
+# addressed as `http://minio:9000`, a `minio-init` bucket-initialisation job, a
+# `minio-media` named volume) and swaps the implementation to RustFS 1.0.0 —
+# Apache-2.0, S3-compatible, `mc`-compatible, same 9000/9001 port pair, and the
+# community-standard replacement for this exact breakage. Consequences kept
+# small on purpose:
+#   - No source change and no env change: S3_ENDPOINT is still a bare http(s)
+#     URL with path-style addressing, exactly what env.ts expects.
+#   - Adopting MinIO again is a one-line `image:` swap plus the env names below
+#     (RUSTFS_* → MINIO_ROOT_*). Nothing else in the repo references them.
+#   - Dev-only impact: the R2-vs-MinIO protocol-equivalence check assigned to
+#     pre-prod must name RustFS explicitly. That is a spec fix, not a silent
+#     edit.
+#
+# PORT COLLISIONS
+# All three published ports are parameterised with a 127.0.0.1 default, so a
+# busy workstation never has to edit this file:
+#   YOMI_DEV_APP_PORT=3000         app            — a local `next dev`/other app
+#   YOMI_DEV_PG_PORT=5432          db             — a host PostgreSQL is the usual cause
+#   YOMI_DEV_S3_PORT=9000          minio (S3)
+#   YOMI_DEV_S3_CONSOLE_PORT=9001  minio console
+# Override on the command line, e.g.
+#   YOMI_DEV_PG_PORT=55432 docker compose -f docker/docker-compose.dev.yml up -d
+# `APP_ORIGIN` is interpolated from YOMI_DEV_APP_PORT, so the app's origin check
+# stays consistent with the published port automatically.
+# On this host 5432 and 5433 were already taken, so the verification run used
+# YOMI_DEV_PG_PORT=55432; 3000/9000/9001 were free.
+# To see what is holding a port before you start: `ss -ltnp | grep -E ':(3000|5432|9000|9001)\b'`
+#
+# FILE WATCHING ON NON-LINUX DOCKER
+# The `app` service bind-mounts the working tree so edits hot-reload. Inotify
+# events are not delivered across Docker Desktop's Linux-VM filesystem boundary
+# (macOS/Windows), so the dev server sees the file and never the event: the page
+# simply does not refresh. There is no good runtime fix — pick one:
+#   1. Polling (works everywhere, costs CPU):
+#        docker compose -f docker/docker-compose.dev.yml \
+#                     -f docker/docker-compose.dev.poll.yml up -d
+#      (`docker-compose.dev.poll.yml` sets WATCHPACK_POLLING=true and is the
+#      only file that does. It is opt-in because polling on Linux is pure waste.)
+#   2. `docker compose watch` (syncs on poll, runs `next build` on change).
+#   3. Keep the editor and the stack on Linux/WSL2 and edit on the WSL2 side.
+# On Linux the default path just works. Two more non-Linux gotchas, both
+# already handled below: the anonymous volumes over /app/node_modules and
+# /app/.next keep the host's platform-specific native modules and host-built
+# output from leaking into the container (Docker Desktop does honour subpath
+# anonymous volumes), and the container runs as uid/gid 1000, which matches the
+# default Linux workstation user; on a host with a different uid, add
+# `user: "<uid>:<gid>"` to the `app` service so `.next/` is not root-owned.
+
+# Shared application environment (required rows only).
+# Anchored so `app`, `migrate` and `minio-init` cannot drift apart: the bucket
+# is created with the same endpoint/credentials the app will use, which is the
+# whole point of doing the init with the app's own S3 client.
+# Every key here is in ENV_VARIABLE_NAMES (src/shared/validation/env.ts); the
+# optional rows are omitted so the module's own defaults apply.
+x-yomi-env: &yomi-env
+  NODE_ENV: development
+  # Bare origin (scheme + host only — env.ts rejects a path, query or userinfo).
+  APP_ORIGIN: "http://localhost:${YOMI_DEV_APP_PORT:-3000}"
+  # 64 hex chars = 256 bits, which is what the schema demands. DEV-ONLY.
+  SESSION_SECRET: "${YOMI_DEV_SESSION_SECRET:-0000000000000000000000000000000000000000000000000000000000000001}"
+  DATABASE_URL: "postgres://yomi_dev:${YOMI_DEV_DB_PASSWORD:-yomi_dev_password}@db:5432/yomi"
+  # DDL-capable DSN for the migration job. In dev it is the same role on purpose:
+  # one role owns the schema, so `db:create` is unnecessary. In prod the app role
+  # must not be DDL-capable, and the boot path is migrateOnBoot() with a separate
+  # maintenance DSN, not this file.
+  MIGRATION_DATABASE_URL: "postgres://yomi_dev:${YOMI_DEV_DB_PASSWORD:-yomi_dev_password}@db:5432/yomi"
+  S3_ENDPOINT: "http://minio:9000"
+  S3_REGION: "us-east-1"
+  S3_BUCKET: "yomi-media"
+  S3_ACCESS_KEY_ID: "${YOMI_DEV_S3_ACCESS_KEY:-yomi-dev-access-key}"
+  S3_SECRET_ACCESS_KEY: "${YOMI_DEV_S3_SECRET_KEY:-yomi-dev-secret-key-0001}"
+  # Next.js' own telemetry is off (data policy). Also set in the image; repeated
+  # here so a plain `docker run` of the image agrees.
+  NEXT_TELEMETRY_DISABLED: "1"
+  # Telemetry is off in dev — no OTEL_* here, which loadEnv reads as
+  # "endpoint unset = telemetry off".
+  PORT: "3000"
+
+name: yomi-dev
+
+services:
+  # PostgreSQL 18.6, pinned by patch version
+  db:
+    # Pinned, not `postgres:18` or `:latest`: a floating tag would let a dev
+    # machine and CI run different minor versions, so the minor version is
+    # pinned. Bump deliberately, in one commit.
+    image: postgres:18.6-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: yomi_dev
+      POSTGRES_PASSWORD: "${YOMI_DEV_DB_PASSWORD:-yomi_dev_password}" # DEV-ONLY
+      POSTGRES_DB: yomi
+      # Deterministic collation so ORDER BY on titles is the same everywhere.
+      # Overridable for a host that needs a different locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=${YOMI_DEV_PG_LOCALE:-C.UTF-8}"
+    # "max_connections 50; app pool 10". The app pool number lives in
+    # server/db/client.ts; the ceiling is set here so a runaway pool fails as a
+    # refused connection instead of a silent overload.
+    command: ["postgres", "-c", "max_connections=50"]
+    volumes:
+      # POSTGRES 18 CHANGED THE DATA DIRECTORY — the widely copied
+      # `- db:/var/lib/postgresql/data` snippet no longer works at all.
+      # The image now sets PGDATA=/var/lib/postgresql/18/docker and declares
+      # the VOLUME at /var/lib/postgresql (not .../data, as in PG 13–17):
+      #   $ docker image inspect postgres:18.6-bookworm \
+      #       --format '{{json .Config.Env}} {{json .Config.Volumes}}'
+      #   [... "PGDATA=/var/lib/postgresql/18/docker"] {"/var/lib/postgresql":{}}
+      # Measured with the old snippet (named volume on .../data):
+      #   $ docker run -d --name p -e POSTGRES_PASSWORD=… -e POSTGRES_USER=… \
+      #       -e POSTGRES_DB=… -v wrongvol:/var/lib/postgresql/data postgres:18.6-bookworm
+      #   $ docker inspect --format '{{.State.ExitCode}}' p   → 1
+      #   $ docker logs p
+      #   "… there appears to be PostgreSQL data in: /var/lib/postgresql/data
+      #    (unused mount/volume) … The suggested container configuration for 18+
+      #    is to place a single mount at /var/lib/postgresql …"
+      # Docker mounts the image's own VOLUME at /var/lib/postgresql as an
+      # ANONYMOUS volume and nests the named one inside it, so the named volume
+      # stays EMPTY (verified: `ls -A` → []) while the real cluster lands in
+      # 18/ inside the anonymous volume. It fails loudly, which is the one
+      # mercy here — but the error names neither volumes nor this file, so the
+      # fix is to mount where the image declares its volume.
+      - db:/var/lib/postgresql
+    ports:
+      # 127.0.0.1 only: the dev password is public in this file, so the port
+      # must not listen on every interface.
+      - "127.0.0.1:${YOMI_DEV_PG_PORT:-5432}:5432"
+    healthcheck:
+      # `depends_on: service_healthy` is what makes the ordering below honest:
+      # postgres runs initdb on first boot and is briefly not accepting
+      # connections, and a migration started in that window fails.
+      test: ["CMD-SHELL", "pg_isready -U yomi_dev -d yomi"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Object storage for dev (the "MinIO" slot; see the FINDING above)
+  minio:
+    image: rustfs/rustfs:1.0.0
+    restart: unless-stopped
+    command: ["server", "/data"]
+    environment:
+      RUSTFS_VOLUMES: "/data"
+      # 0.0.0.0 or the container is unreachable from `app`; the host reachability
+      # is controlled by the published port, not by the bind address.
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      # DEV-ONLY. These must equal S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY above,
+      # which is why both live in this one file; a mismatch surfaces as a
+      # confusing SignatureDoesNotMatch rather than a config error.
+      RUSTFS_ACCESS_KEY: "${YOMI_DEV_S3_ACCESS_KEY:-yomi-dev-access-key}"
+      RUSTFS_SECRET_KEY: "${YOMI_DEV_S3_SECRET_KEY:-yomi-dev-secret-key-0001}"
+    volumes:
+      - minio-media:/data
+    ports:
+      - "127.0.0.1:${YOMI_DEV_S3_PORT:-9000}:9000"
+      - "127.0.0.1:${YOMI_DEV_S3_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      # Verified on rustfs/rustfs:1.0.0: /health and /minio/health/live both
+      # answer 200 once the server binds, and this image does ship curl (checked,
+      # not assumed). The MinIO-compatible path is used deliberately so this line
+      # keeps working unchanged if a MinIO release ever becomes obtainable again.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # One-shot: create the bucket, then exit 0
+  # Two gates, on purpose, because they prove different things: the healthcheck
+  # above proves the port answers, and this job proves the S3 API accepts these
+  # credentials and can create the bucket. A healthy port with a wrong key is
+  # the failure a developer would otherwise meet 30 seconds later as a
+  # SignatureDoesNotMatch.
+  minio-init:
+    image: yomi-dev:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: dev
+    restart: "no"
+    command: ["sh", "docker/init-s3-bucket.sh"]
+    environment: *yomi-env
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # One-shot: apply drizzle/ before anything serves.
+  # Why a separate service instead of the app booting migrations: the boot-time
+  # gate `migrateOnBoot()` exists and is documented, but the composition root
+  # (src/server/composition.ts) is still a skeleton that throws, so nothing
+  # calls it yet. `drizzle-kit migrate` is the path drizzle.config.ts documents
+  # for exactly this case ("for local/dev/CI stepping"). When migrateOnBoot() is
+  # wired and the boot path is honoured in the image, this service becomes
+  # redundant — do not leave two migration paths in the prod topology.
+  migrate:
+    image: yomi-dev:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: dev
+    restart: "no"
+    command: ["npm", "run", "db:migrate"]
+    environment: *yomi-env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # The app (dev mode)
+  app:
+    image: yomi-dev:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: dev
+    restart: unless-stopped
+    # tini reaps Next's children, so `docker stop` is a clean SIGTERM rather
+    # than a killed process tree that leaves a stale .next lock behind.
+    init: true
+    environment: *yomi-env
+    volumes:
+      # The working tree, so edits hot-reload.
+      - ..:/app
+      # Anonymous volumes that shadow the two directories the host owns. Without
+      # these, the bind mount would drag the host's node_modules (built for the
+      # host's OS/arch) over the image's — which is exactly the native-module
+      # break the image is built to prevent — and the host's .next (built by the
+      # host's Next) over the container's. Anonymous, not named: they are
+      # disposable build state, not data, and `down -v` should discard them.
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "127.0.0.1:${YOMI_DEV_APP_PORT:-3000}:3000"
+    depends_on:
+      # service_completed_successfully, not service_started: the app must not
+      # serve a schema that does not exist yet, and must not start against a
+      # bucket that was never created.
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+
+# Named volumes
+volumes:
+  db:
+    # No host path on purpose. A bind mount here would put the database inside
+    # the working tree and make `rm -rf` of a clone a data-loss event.
+  minio-media:

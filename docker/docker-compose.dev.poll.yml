@@ -1,0 +1,36 @@
+# Optional overlay: polling file watching for non-Linux Docker.
+#
+# On Docker Desktop (macOS/Windows) the bind mount is served by a Linux VM, and
+# inotify events do not cross that boundary. Next's dev server therefore never
+# learns that a file changed: save, and the browser keeps showing the old page
+# until you touch the URL. Nothing in the logs looks wrong — that silence is the
+# symptom. On Linux (including WSL2 with the project inside the WSL2 filesystem)
+# the default setup already works and this file is unnecessary.
+#
+# It is an overlay rather than a variable in the main file because
+# WATCHPACK_POLLING is read as a string, and a variable that is "unset by
+# default" would have to be passed as an empty string — which several watcher
+# implementations treat as truthy. A separate file means the default path sets
+# nothing (so Linux pays no polling cost) and the opt-in path sets an
+# unambiguous "true".
+#
+# Polling stats the source tree on an interval: measurable CPU on a large tree,
+# and slower than inotify. Drop this overlay when you are back on Linux.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.dev.yml \
+#                    -f docker/docker-compose.dev.poll.yml up -d
+#   # tear down (the overlay has no state of its own, so one -f list is enough)
+#   docker compose -f docker/docker-compose.dev.yml \
+#                    -f docker/docker-compose.dev.poll.yml down -v
+#
+# Alternative, if you would rather not poll: `docker compose watch` (syncs on
+# poll, but rebuilds instead of hot-reloading) or keep everything on Linux/WSL2.
+
+services:
+  app:
+    environment:
+      WATCHPACK_POLLING: "true"
+
+  # The migration job compiles drizzle.config.ts and never watches anything, so
+  # it is deliberately NOT given the variable.
