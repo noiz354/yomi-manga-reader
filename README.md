@@ -54,3 +54,5 @@ npm run test:integration   # needs the compose services up
 npm run test:e2e           # needs the app + a seeded database
 npm run build
 ```
+
+<!-- woodpecker test trigger 2026-10-19T08:53:48Z -->
