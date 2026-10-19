@@ -1,0 +1,28 @@
+when:
+  - event: [push, pull_request]
+
+steps:
+  - name: install
+    image: node:22-alpine
+    commands:
+      - npm ci
+
+  - name: lint
+    image: node:22-alpine
+    commands:
+      - npm run lint
+
+  - name: typecheck
+    image: node:22-alpine
+    commands:
+      - npm run typecheck
+
+  - name: test
+    image: node:22-alpine
+    commands:
+      - npm run test
+
+  - name: build
+    image: node:22-alpine
+    commands:
+      - npm run build
